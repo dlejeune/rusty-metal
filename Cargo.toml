@@ -1,6 +1,15 @@
 [package]
 name = "rusty-metAL"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
+anyhow = "1.0.97"
+clap = { version = "4.5.31", features = ["derive"] }
+seq_io = "0.3.4"
+thiserror = "2.0.12"
+log = "0.4.22"
+colored = "3.0.0"
+simple_logger = "5.0.0"
+itertools = "0.14.0"
+rayon = "1.11.0"
