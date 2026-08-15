@@ -14,9 +14,10 @@
 //!   that are not over the same sequences at all.
 //! - **Element identity excludes the raw character.** See [`Element`].
 //!
-//! The shape of the result mirrors the old `MsaHashSets`: indexed
-//! `[sequence][residue position]`, with `None` meaning "this sequence has no residue at
-//! that position" (i.e. past its end).
+//! A residue is addressed as `[sequence][residue position]`, with `None` meaning "this
+//! sequence has no residue at that position" (i.e. past its end). The old `MsaHashSets`
+//! stored a separate set at every one of those slots; [`HomologyView`] stores one set
+//! per *column* and indexes into it, which is the `CODE_REVIEW.md` §2 fix.
 
 use crate::msa::{Msa, is_gap};
 use anyhow::{Result, bail};
@@ -179,15 +180,95 @@ fn format_names(names: &[&str]) -> String {
     }
 }
 
-/// The homology sets of one alignment, indexed `[registry sequence index][residue
-/// position]`.
+/// The homology sets of one alignment.
 ///
-/// `None` at `[s][p]` means sequence `s` has no residue at position `p` — either
-/// because the sequence is shorter than that, or (for an index beyond the registry's
-/// sequences) because there is nothing there at all. The outer dimension is indexed by
-/// **registry index**, so two views built against the same [`Registry`] are row-aligned
-/// regardless of the record order in either file.
-pub type HomologyView = Vec<Vec<Option<HashSet<Element>>>>;
+/// A residue's homology set is *its whole column minus itself*. This stores one set per
+/// **column**, shared by every residue in it, plus an index from
+/// `[registry sequence index][residue position]` to the column that residue sits in.
+/// The "minus itself" is never materialised — see [`HomologyView::column_of`] for why
+/// it does not need to be.
+///
+/// The sequence dimension is indexed by **registry index**, so two views built against
+/// the same [`Registry`] are row-aligned regardless of record order in either file.
+///
+/// # Why this is not one set per residue
+///
+/// It used to be, and that was `CODE_REVIEW.md` §2: cloning the column set for every
+/// residue costs O(num_seqs² × width) live memory per alignment, both alignments are
+/// held at once, and that is multiplied again by the number of pairs running
+/// concurrently. A 500 × 5000 alignment came to roughly 1.2×10⁹ set entries. It was a
+/// hard ceiling on usable input size rather than a micro-optimisation.
+///
+/// Sharing the column set brings that to O(num_seqs × width) — the size of the
+/// alignment itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HomologyView {
+    /// One set per column of the alignment, in column order. Each holds exactly one
+    /// element per sequence, so `len()` is the alignment's sequence count.
+    columns: Vec<HashSet<Element>>,
+    /// `[registry sequence index][residue position]` -> index into `columns`.
+    ///
+    /// `None` means that sequence has no residue at that position, either because it
+    /// has fewer residues than the alignment is wide or because the slot was never
+    /// filled. Gaps never get a slot: they appear only *inside* the columns of the
+    /// residues they sit alongside.
+    slots: Vec<Vec<Option<usize>>>,
+}
+
+impl HomologyView {
+    /// The column containing the residue at `(sequence, position)`, or `None` if there
+    /// is no residue there.
+    ///
+    /// **This is the residue's homology set *including* the residue itself**, which is
+    /// deliberate and is what lets the sets be shared. Two facts make the difference
+    /// cancel when two views are compared:
+    ///
+    /// - A residue's own element is `{sequence, position, gap: false}`, and that is the
+    ///   same value in *both* alignments — a residue's identity does not depend on
+    ///   where the gaps around it sit. Call it `x`.
+    /// - `x` is therefore in both columns, so it is in neither symmetric difference:
+    ///   `(Ca \ {x}) Δ (Cb \ {x}) == Ca Δ Cb`.
+    ///
+    /// So the numerator can be taken from the columns directly. Only the denominator
+    /// has to remember the exclusion, by subtracting one from each column's size — see
+    /// `distance::compute_symmetric_difference`.
+    pub fn column_of(&self, sequence: usize, position: usize) -> Option<&HashSet<Element>> {
+        let column = (*self.slots.get(sequence)?.get(position)?)?;
+        self.columns.get(column)
+    }
+
+    /// The number of residue positions addressable per sequence — the width of the
+    /// alignment this view was built from.
+    pub fn width(&self) -> usize {
+        self.slots.first().map_or(0, |positions| positions.len())
+    }
+
+    /// The homology set of the residue at `(sequence, position)`: its column **minus
+    /// the residue itself**, which is the definition the metric is stated in terms of.
+    ///
+    /// Allocates, because it materialises the exclusion that [`HomologyView::column_of`]
+    /// exists to avoid. `#[cfg(test)]` for that reason: the distance path must not call
+    /// it, or `CODE_REVIEW.md` §2 comes straight back. It is here so the tests can
+    /// assert homology sets as they are defined rather than as they are stored.
+    #[cfg(test)]
+    pub fn homology_set_of(&self, sequence: usize, position: usize) -> Option<HashSet<Element>> {
+        let column = self.column_of(sequence, position)?;
+        let mut set = column.clone();
+        set.remove(&Element {
+            seq: sequence as u32,
+            position: Some(position as u32),
+            gap: false,
+        });
+        Some(set)
+    }
+
+    /// Every column in the view, for tests that need to reason about sharing rather
+    /// than about a particular residue.
+    #[cfg(test)]
+    pub fn columns(&self) -> &[HashSet<Element>] {
+        &self.columns
+    }
+}
 
 /// Builds the [`HomologyView`] for `msa`, resolving sequence ids through `registry`.
 ///
@@ -231,32 +312,27 @@ pub fn homology_view(msa: &Msa, registry: &Registry) -> Result<HomologyView> {
     // views in a comparison have the same outer length. They are in practice equal —
     // `Registry::for_pair` guarantees the same name set — but indexing by registry
     // index means nothing here may assume row index == registry index.
-    let mut view: HomologyView = vec![vec![None; width]; registry.len()];
+    let mut slots: Vec<Vec<Option<usize>>> = vec![vec![None; width]; registry.len()];
+    let mut columns: Vec<HashSet<Element>> = Vec::with_capacity(width);
 
     for col in 0..width {
-        // TODO(CODE_REVIEW.md §2): this clones a `HashSet` of `num_seqs` entries for
-        // every residue, i.e. O(num_seqs^2 * width) live memory per alignment. It is
-        // kept identical to `utils::create_hashsets` on purpose so that this stage can
-        // be shown to be behaviour-preserving; switching to a shared per-column set
-        // with a "remove self" view changes the symmetric-difference computation and is
-        // deferred to its own change.
-        let column: HashSet<Element> = elements.iter().map(|row| row[col]).collect();
+        // One set per column, built once and pointed at by every residue in it. See
+        // the `HomologyView` docs: this is the fix for `CODE_REVIEW.md` §2, which used
+        // to clone this set per residue.
+        columns.push(elements.iter().map(|row| row[col]).collect());
 
         for (row_idx, row) in elements.iter().enumerate() {
             let item = row[col];
-            // Gaps get no homology set of their own; they only ever appear *inside* the
-            // sets of the residues they share a column with.
+            // Gaps get no slot of their own; they only ever appear *inside* the columns
+            // of the residues they share a column with.
             if let (false, Some(position)) = (item.gap, item.position) {
-                let mut item_set = column.clone();
-                item_set.remove(&item);
-
                 let seq_slot = seq_ids[row_idx] as usize;
                 let position_slot = position as usize;
-                match view
+                match slots
                     .get_mut(seq_slot)
                     .and_then(|s| s.get_mut(position_slot))
                 {
-                    Some(slot) => *slot = Some(item_set),
+                    Some(slot) => *slot = Some(col),
                     // Unreachable: `seq_slot` came from the registry and `position` is
                     // an index among this row's residues, so it is < width. Handled
                     // rather than indexed so a future change cannot turn it into a
@@ -274,7 +350,7 @@ pub fn homology_view(msa: &Msa, registry: &Registry) -> Result<HomologyView> {
         }
     }
 
-    Ok(view)
+    Ok(HomologyView { columns, slots })
 }
 
 /// Turns one row of the alignment into elements, assigning positions exactly as the old
@@ -657,8 +733,12 @@ mod tests {
         // Sequence a, position 2 (column 3): shares its column with b's gap that
         // follows b's residue 1.
         // Positions 3 and 4 are past the end of a's three residues.
+        let row_of = |sequence: usize| -> Vec<Option<HashSet<Element>>> {
+            (0..5).map(|p| view.homology_set_of(sequence, p)).collect()
+        };
+
         assert_eq!(
-            view[0],
+            row_of(0),
             vec![
                 Some(set(&[gap(1, None)])),
                 Some(set(&[residue(1, 1)])),
@@ -670,7 +750,7 @@ mod tests {
 
         // And the other row, for completeness.
         assert_eq!(
-            view[1],
+            row_of(1),
             vec![
                 Some(set(&[gap(0, Some(0))])),
                 Some(set(&[residue(0, 1)])),
@@ -688,14 +768,40 @@ mod tests {
         let view = homology_view(&m, &registry).expect("view should build");
 
         // Column 0 holds three residues; each one's set is the other two.
-        assert_eq!(view[0][0], Some(set(&[residue(1, 0), residue(2, 0)])));
-        assert_eq!(view[1][0], Some(set(&[residue(0, 0), residue(2, 0)])));
-        assert_eq!(view[2][0], Some(set(&[residue(0, 0), residue(1, 0)])));
+        assert_eq!(
+            view.homology_set_of(0, 0),
+            Some(set(&[residue(1, 0), residue(2, 0)]))
+        );
+        assert_eq!(
+            view.homology_set_of(1, 0),
+            Some(set(&[residue(0, 0), residue(2, 0)]))
+        );
+        assert_eq!(
+            view.homology_set_of(2, 0),
+            Some(set(&[residue(0, 0), residue(1, 0)]))
+        );
 
         // Column 1 holds two residues and one gap; the gap appears in the residues'
         // sets but has no set of its own.
-        assert_eq!(view[0][1], Some(set(&[residue(1, 1), gap(2, Some(0))])));
-        assert_eq!(view[2][1], None, "sequence c has only one residue");
+        assert_eq!(
+            view.homology_set_of(0, 1),
+            Some(set(&[residue(1, 1), gap(2, Some(0))]))
+        );
+        assert_eq!(
+            view.homology_set_of(2, 1),
+            None,
+            "sequence c has only one residue"
+        );
+
+        // The stored form shares one set per column rather than holding one per
+        // residue — the whole point of the `CODE_REVIEW.md` §2 fix. The residue *is*
+        // in the stored column; it is only absent from the derived homology set.
+        assert_eq!(view.columns().len(), m.width());
+        assert!(
+            view.column_of(0, 0)
+                .expect("a residue")
+                .contains(&residue(0, 0))
+        );
     }
 
     #[test]

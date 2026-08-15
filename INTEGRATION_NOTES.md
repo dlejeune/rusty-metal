@@ -835,3 +835,94 @@ reproducible and no dependency was added. Stage 6 added no dependencies.
 never been run through it, so formatting it now would reformat far more than this merge
 and bury the Stage 6 diff. There is a separate `just fmt` recipe; doing it deserves its
 own commit.
+
+---
+
+## Stage 7 â€” the memory ceiling (`CODE_REVIEW.md` Â§2) â€” DONE
+
+The last outstanding review finding. `HomologyView` changed from a type alias
+(`Vec<Vec<Option<HashSet<Element>>>>`, one materialised set per residue) to a struct
+holding **one set per column**, shared, plus an index from `[sequence][position]` to a
+column. 93 unit tests, all passing; no build, clippy or rustdoc warnings.
+
+Live memory per alignment: **O(num_seqsÂ² Ã— width) â†’ O(num_seqs Ã— width)** â€” the size of
+the alignment itself. The review's example, a 500 Ã— 5000 alignment, went from roughly
+1.2Ã—10â¹ set entries to 2.5Ã—10â¶.
+
+### It is exact, and that is the whole argument
+
+The stored column includes the residue itself; the homology set is the column minus that
+one element. The two are reconciled differently in the two halves of the fraction, and
+only one of them needs any reconciling at all:
+
+- **Numerator needs none.** The excluded element is `x = {sequence, position, gap:
+  false}`. A residue's identity does not depend on the gaps around it, so `x` is the
+  *same value* in both alignments. It is therefore in both columns, and so in neither
+  symmetric difference: `(Ca \ {x}) Î” (Cb \ {x}) == Ca Î” Cb`.
+- **Denominator subtracts one per side**, `|A| = |Ca| - 1`.
+
+That identity is what makes this a pure memory change rather than a numeric one. Every
+pinned value in the suite â€” `0.21428571428571427`, `0.5`, `0`,
+`0.35714285714285715` â€” was unchanged, and no test expectation was edited.
+
+`sharing_the_column_sets_computes_exactly_the_materialised_distance` checks the identity
+against a literal implementation that materialises every homology set, **exhaustively
+over every 2Ã—3 and 3Ã—2 alignment over {A, -} compared against every other** â€” 8192
+comparisons. Exhaustive rather than sampled because the alignment space at that size is
+small enough to enumerate, which is a stronger claim than any number of random draws.
+
+### Measured, not just reasoned about
+
+Two random 400-sequence Ã— 2000-column alignments, release build:
+
+```
+--no-standardise   0.86 s
+with standardisation   0.79 s
+```
+
+Under the old shape the same input needed roughly 3.6 GB of homology sets and would have
+thrashed or died. Two incidental findings from that run:
+
+- **Standardisation is nearly free on dense alignments, and a no-op on them.** With 400
+  sequences at ~50% residue density, almost every pair of columns shares a residue row,
+  so almost everything is pinned and nothing can move. The distance came back identical
+  with and without standardisation. `columns_are_pinned` short-circuits on the first
+  shared row, so the O(widthÂ²) pair scan is cheap in exactly the case that has the most
+  pairs.
+- **Sparse alignments are fast for the opposite reason.** 60 sequences Ã— 2000 columns at
+  97% gaps ran in 0.16 s: most columns are all-gap, and dropping them shrinks the width
+  before the quadratic work starts.
+
+So the deferred O(widthÂ² Ã— num_seqs) comparator cost needs a specific shape to bite â€”
+many columns, few sequences, and a gap density high enough that columns are mutually
+free but low enough that they are not all-gap. Nothing pathological showed up on
+realistic inputs. Still deferred, but now with a measurement behind the deferral rather
+than an assumption.
+
+### API notes
+
+- `HomologyView::column_of(seq, pos)` is what the distance path uses. Its doc comment
+  carries the cancellation argument, because the returned set is *not* the homology set
+  and a caller assuming otherwise would be wrong by exactly one element.
+- `HomologyView::homology_set_of(seq, pos)` materialises the exclusion and returns the
+  homology set as defined. It is `#[cfg(test)]` on purpose: if the distance path ever
+  calls it, Â§2 comes straight back. The existing hand-worked tests were repointed at it
+  rather than weakened, so they still assert homology sets as the metric defines them.
+- `every_homology_set_has_size_num_seqs_minus_one` still holds and still pins the
+  invariant that keeps `2Â·|A|` and `|A| + |B|` numerically equal. Stage 4 predicted this
+  fix would break that invariant and make the two denominators genuinely differ. **It
+  does not** â€” sharing the column set does not change any set's cardinality. The
+  prediction was about a different candidate fix (moving to residues-only or gap-filtered
+  sets), which remains unimplemented.
+
+### `CODE_REVIEW.md` is now fully discharged
+
+Every finding in the review is addressed: Â§0 (both), Â§1 (all three panics), Â§2, Â§3
+(both), Â§4 (both), Â§5 (both), and the build warnings. Nothing in that document is
+outstanding.
+
+Remaining known work, none of it from the review:
+
+- The O(widthÂ² Ã— num_seqs) ordering cost, deferred with the measurements above.
+- No Dockerfile, though the justfile has `build-docker` recipes referencing one.
+
