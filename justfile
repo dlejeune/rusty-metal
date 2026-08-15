@@ -1,7 +1,9 @@
 #!/usr/bin/env just --justfile
 
 latest-tag := "0.2.0"
-image-name := "dlejeune/pipeline-utils-rs"
+# Matches the crate and binary name. Was `dlejeune/pipeline-utils-rs`, which matched
+# nothing else in the repo.
+image-name := "dlejeune/rusty-metal"
 
 default:
     just --list
@@ -19,7 +21,7 @@ push-docker:
 # Runs an interactive docker container with the current wd mounted at /data
 [group('docker')]
 run-docker-it tag=latest-tag:
-    sudo docker run --rm -it -v ./:/data dlejeune/{{ image-name }}:{{ tag }} bash
+    sudo docker run --rm -it -v ./:/data {{ image-name }}:{{ tag }} bash
 
 # Builds and pushed the most recently tagged branch in a docker container
 [group('docker')]

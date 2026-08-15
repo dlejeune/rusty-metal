@@ -289,7 +289,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rusty-metAL"
+name = "rusty-metal"
 version = "0.2.0"
 dependencies = [
  "anyhow",

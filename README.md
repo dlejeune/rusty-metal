@@ -1,7 +1,10 @@
-# rusty-metal
+# rusty-metAL
 
 Pairwise distances between multiple sequence alignments, based on how much the
 alignments disagree about which residues are homologous to which.
+
+The crate and the binary are `rusty-metal`, all lower case; `rusty-metAL` is the
+stylised form used in prose and help output.
 
 As of `0.2.0` this also subsumes the standalone `standardise-msa` tool: column
 standardisation is now the first stage of the pipeline rather than a separate program.

@@ -57,6 +57,14 @@ mod msa;
 mod standardise;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The stylised form of the name, for output a human reads.
+///
+/// The binary itself is `rusty-metal`, all lower case — that is what gets typed, what
+/// clap prints in its usage line, and what the Docker image is tagged with. This form
+/// is for prose: the startup banner and the help text. Keep the two distinct rather
+/// than making anything case-insensitive.
+const DISPLAY_NAME: &str = "rusty-metAL";
 const STYLES: styling::Styles = styling::Styles::styled()
     .header(styling::AnsiColor::Green.on_default().bold())
     .usage(styling::AnsiColor::Green.on_default().bold())
@@ -601,7 +609,11 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let plan = RunPlan::from_args(&args)?;
 
-    log::info!("This is rusty-metal version {}", VERSION.bold().cyan());
+    log::info!(
+        "This is {} version {}",
+        DISPLAY_NAME.bold(),
+        VERSION.bold().cyan()
+    );
     if args.standardise_only && args.output_fp.is_some() {
         // Not an error — the flag combination is coherent, just pointless — but silently
         // ignoring an explicitly requested output path would be worse than saying so.

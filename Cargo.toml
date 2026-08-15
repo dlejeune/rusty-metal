@@ -1,7 +1,12 @@
 [package]
-name = "rusty-metAL"
+# The crate and binary are `rusty-metal`, all lower case: it is what gets typed on a
+# command line and what package tooling sorts and matches on. The stylised form
+# `rusty-metAL` is the display name, and appears in help output, the startup banner and
+# the README. See `DISPLAY_NAME` in `src/main.rs`.
+name = "rusty-metal"
 version = "0.2.0"
 edition = "2024"
+description = "rusty-metAL: pairwise distances between multiple sequence alignments, measured over homology sets"
 
 [dependencies]
 anyhow = "1.0.97"
