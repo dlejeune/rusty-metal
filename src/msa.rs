@@ -13,10 +13,10 @@
 //! Losing either of those is fine for a pure distance metric, but not for a tool that
 //! writes alignments back to disk, which is why this type exists.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use seq_io::fasta::{Reader, Record};
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, Write};
@@ -255,8 +255,7 @@ pub fn read_msa<P: AsRef<Path>>(path: P) -> Result<Msa> {
         );
     }
 
-    Msa::new(names, rows)
-        .with_context(|| format!("Invalid MSA in {}", path.as_ref().display()))
+    Msa::new(names, rows).with_context(|| format!("Invalid MSA in {}", path.as_ref().display()))
 }
 
 /// Writes an MSA back out as FASTA.
@@ -377,16 +376,8 @@ mod tests {
 
     #[test]
     fn residue_hash_ignores_gap_placement() {
-        let a = Msa::new(
-            vec!["s1".to_string()],
-            vec![b"A--A".to_vec()],
-        )
-        .expect("valid Msa");
-        let b = Msa::new(
-            vec!["s1".to_string()],
-            vec![b"AA--".to_vec()],
-        )
-        .expect("valid Msa");
+        let a = Msa::new(vec!["s1".to_string()], vec![b"A--A".to_vec()]).expect("valid Msa");
+        let b = Msa::new(vec!["s1".to_string()], vec![b"AA--".to_vec()]).expect("valid Msa");
 
         assert_eq!(a.residue_hash(), b.residue_hash());
     }
@@ -482,7 +473,8 @@ mod tests {
         )
         .expect("valid Msa");
 
-        msa.select_columns(&[2, 0]).expect("a subset is a valid selection");
+        msa.select_columns(&[2, 0])
+            .expect("a subset is a valid selection");
 
         assert_eq!(msa.rows()[0], b"CA".to_vec());
         assert_eq!(msa.rows()[1], b"ca".to_vec());
@@ -494,11 +486,16 @@ mod tests {
         // Reachable: an alignment of nothing but gaps standardises to no columns.
         let mut msa = Msa::new(vec!["s1".to_string()], vec![b"ABCD".to_vec()]).expect("valid Msa");
 
-        msa.select_columns(&[]).expect("an empty selection is representable");
+        msa.select_columns(&[])
+            .expect("an empty selection is representable");
 
         assert_eq!(msa.width(), 0);
         assert_eq!(msa.rows()[0], Vec::<u8>::new());
-        assert_eq!(msa.num_seqs(), 1, "dropping columns must not drop sequences");
+        assert_eq!(
+            msa.num_seqs(),
+            1,
+            "dropping columns must not drop sequences"
+        );
     }
 
     #[test]
@@ -511,7 +508,10 @@ mod tests {
 
         msa.sort_sequences_by_name();
 
-        assert_eq!(msa.names(), &["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(
+            msa.names(),
+            &["a".to_string(), "b".to_string(), "c".to_string()]
+        );
         assert_eq!(
             msa.rows(),
             &[b"AA".to_vec(), b"BB".to_vec(), b"CC".to_vec()]

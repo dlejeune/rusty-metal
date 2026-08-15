@@ -1,6 +1,11 @@
-//! Canonicalisation of an alignment: sort the sequences by name, then permute the
-//! columns into a canonical order, proving via a residue hash that no residue content
-//! moved relative to any other residue in its own row.
+//! Canonicalisation of an alignment: sort the sequences by name, drop every column
+//! holding no residue, and rewrite the rest into a canonical order — proving via a
+//! residue hash that no residue content moved relative to any other residue in its own
+//! row.
+//!
+//! The result is a genuine canonical form. Two alignments differing only by a legal
+//! column permutation standardise to byte-identical output, which is the property the
+//! distance metric relies on and the reason this stage exists.
 //!
 //! Originally ported from the standalone `standardise-msa` tool (`src/main.rs` @
 //! `97978c9`), re-expressed over the shared [`Msa`] type: the original transposed the
@@ -21,10 +26,10 @@
 //! The distance treats a gap's identity as "the index of the residue preceding it in
 //! its row". Permuting columns moves residues within a row, so the same gap acquires a
 //! different identity, hence different homology sets. Residues themselves are never
-//! affected, because the comparator below never swaps two columns that both hold a
-//! residue in the same row — which is precisely the invariant [`Msa::residue_hash`]
-//! verifies. Standardising both inputs therefore strips gap-placement artefacts out of
-//! the distance.
+//! affected, because [`canonical_columns`] never moves one column past another when
+//! both hold a residue in the same row — which is precisely the invariant
+//! [`Msa::residue_hash`] verifies. Standardising both inputs therefore strips
+//! gap-placement artefacts out of the distance.
 //!
 //! # Intentional divergences from the original
 //!
@@ -41,25 +46,12 @@
 //! Output is therefore **not** byte-compatible with `standardise-msa`, and distances
 //! computed after standardisation differ from those of any earlier build of this crate.
 
-use crate::msa::{is_gap, Msa};
-use anyhow::{bail, Context, Result};
+use crate::msa::{Msa, is_gap};
+use anyhow::{Context, Result, bail};
 use std::cmp::Ordering;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-/// Whether two columns are **pinned**: whether they are forbidden from moving past
-/// each other.
-///
-/// This is a direct port of `Column::eq` in the original tool, where `eq` returning
-/// `true` meant "pinned", not "equal" in any ordinary sense.
-///
-/// **This predicate is not an equivalence relation and is deliberately
-/// non-transitive.** A may be movable past B, and B past C, while A is pinned against
-/// C — a residue in a row that A and C share but B does not is enough. Consult
-/// `column_order` before reaching for a standard sort.
-///
-/// Two columns are pinned when any row holds a residue in *both* of them: swapping
-/// would reverse those two residues within that row and corrupt the sequence.
 /// Whether two columns are **pinned**: whether they are forbidden from moving past
 /// each other.
 ///
@@ -303,14 +295,21 @@ mod tests {
 
     #[test]
     fn standardise_is_idempotent() {
-        for fixture in ["test/test.fasta", "test/test2.fasta", "test/unsorted_names.fasta"] {
+        for fixture in [
+            "test/test.fasta",
+            "test/test2.fasta",
+            "test/unsorted_names.fasta",
+        ] {
             let mut once = read_msa(fixture).expect("fixture should read");
             standardise(&mut once).expect("standardisation should succeed");
 
             let mut twice = once.clone();
             standardise(&mut twice).expect("re-standardisation should succeed");
 
-            assert_eq!(once, twice, "standardisation of {fixture} is not idempotent");
+            assert_eq!(
+                once, twice,
+                "standardisation of {fixture} is not idempotent"
+            );
         }
     }
 
@@ -415,10 +414,7 @@ mod tests {
         let mut m = msa(&[("a", "A-"), ("b", "-B")]);
         standardise(&mut m).expect("standardisation should succeed");
 
-        assert_eq!(
-            rows_as_strings(&m),
-            expected(&[("a", "A-"), ("b", "-B")])
-        );
+        assert_eq!(rows_as_strings(&m), expected(&[("a", "A-"), ("b", "-B")]));
 
         // And the mirror input must be pulled into that same canonical form.
         let mut m = msa(&[("a", "-A"), ("b", "B-")]);
@@ -509,20 +505,14 @@ mod tests {
         let mut m = msa(&[("a", "A."), ("b", ".B")]);
         standardise(&mut m).expect("standardisation should succeed");
 
-        assert_eq!(
-            rows_as_strings(&m),
-            expected(&[("a", "A."), ("b", ".B")])
-        );
+        assert_eq!(rows_as_strings(&m), expected(&[("a", "A."), ("b", ".B")]));
 
         // The mirror form must converge on the same layout. Note the gap characters
         // travel with their columns, so the `.` lands in row `b` here.
         let mut m = msa(&[("a", ".A"), ("b", "B.")]);
         standardise(&mut m).expect("standardisation should succeed");
 
-        assert_eq!(
-            rows_as_strings(&m),
-            expected(&[("a", "A."), ("b", ".B")])
-        );
+        assert_eq!(rows_as_strings(&m), expected(&[("a", "A."), ("b", ".B")]));
     }
 
     #[test]
@@ -538,14 +528,18 @@ mod tests {
         let m = msa(&[("a", "A-C"), ("b", "-.C")]);
         let cols = canonical_columns(&m);
 
-        assert!(!cols.contains(&1), "an all-gap column must not be selected, got {cols:?}");
+        assert!(
+            !cols.contains(&1),
+            "an all-gap column must not be selected, got {cols:?}"
+        );
         assert_eq!(cols.len(), 2);
     }
 
     #[test]
     fn select_columns_accepts_a_subset_and_shrinks_the_width() {
         let mut m = msa(&[("a", "ABCD")]);
-        m.select_columns(&[3, 0]).expect("a subset is a legitimate selection");
+        m.select_columns(&[3, 0])
+            .expect("a subset is a legitimate selection");
 
         assert_eq!(rows_as_strings(&m), expected(&[("a", "DA")]));
         assert_eq!(m.width(), 2);
@@ -558,7 +552,11 @@ mod tests {
             m.select_columns(&[0, 1, 2, 3, 3]).is_err(),
             "more indices than there are columns cannot be satisfied without a repeat"
         );
-        assert_eq!(m.rows()[0], b"ABCD".to_vec(), "a rejected selection must not mutate");
+        assert_eq!(
+            m.rows()[0],
+            b"ABCD".to_vec(),
+            "a rejected selection must not mutate"
+        );
     }
 
     #[test]
@@ -621,7 +619,11 @@ mod tests {
         };
         let names = (0..num_seqs).map(|i| format!("s{i}")).collect();
         let rows = (0..num_seqs)
-            .map(|_| (0..width).map(|_| alphabet[rng.below(alphabet.len())]).collect())
+            .map(|_| {
+                (0..width)
+                    .map(|_| alphabet[rng.below(alphabet.len())])
+                    .collect()
+            })
             .collect();
         Msa::new(names, rows).expect("generated alignment should be valid")
     }

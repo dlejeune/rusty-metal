@@ -37,12 +37,12 @@
 //! per-pair handler entirely, so this file avoids `unwrap`/`expect` outside its tests.
 
 use crate::distance::compute_symmetric_difference;
-use crate::homology::{homology_view, Registry};
-use crate::msa::{read_msa, write_msa, Msa};
+use crate::homology::{Registry, homology_view};
+use crate::msa::{Msa, read_msa, write_msa};
 use crate::standardise::standardise;
-use anyhow::{bail, Context, Result};
-use clap::builder::styling;
+use anyhow::{Context, Result, bail};
 use clap::Parser;
+use clap::builder::styling;
 use colored::Colorize;
 use itertools::Itertools;
 use rayon::prelude::*;
@@ -344,9 +344,8 @@ fn check_stem_collisions(inputs: &[PathBuf]) -> Result<()> {
                 .join(", ")
         ));
     }
-    message.push_str(
-        "\nRename the inputs, or emit them into separate directories in separate runs.",
-    );
+    message
+        .push_str("\nRename the inputs, or emit them into separate directories in separate runs.");
 
     bail!(message)
 }
@@ -707,8 +706,15 @@ mod tests {
     #[test]
     fn plan_accepts_distances_and_emission_together() {
         // rusty-metal -o dist.csv --emit-standardised out/ a.fa b.fa
-        let plan = parse(&["-o", "dist.csv", "--emit-standardised", "out", "a.fa", "b.fa"])
-            .expect("valid invocation");
+        let plan = parse(&[
+            "-o",
+            "dist.csv",
+            "--emit-standardised",
+            "out",
+            "a.fa",
+            "b.fa",
+        ])
+        .expect("valid invocation");
         assert_eq!(
             plan.mode,
             Mode::Distances {
@@ -744,8 +750,8 @@ mod tests {
     #[test]
     fn plan_accepts_the_no_standardise_escape_hatch() {
         // rusty-metal -o dist.csv --no-standardise a.fa b.fa
-        let plan =
-            parse(&["-o", "dist.csv", "--no-standardise", "a.fa", "b.fa"]).expect("valid invocation");
+        let plan = parse(&["-o", "dist.csv", "--no-standardise", "a.fa", "b.fa"])
+            .expect("valid invocation");
         assert_eq!(
             plan.mode,
             Mode::Distances {
@@ -854,8 +860,14 @@ mod tests {
         assert!(err.contains("aln.standardised.fasta"), "got: {err}");
         // Both colliding inputs must be named, since the point is to say which files to
         // rename.
-        assert!(err.contains("a/aln.fasta") || err.contains("a\\aln.fasta"), "got: {err}");
-        assert!(err.contains("b/aln.fasta") || err.contains("b\\aln.fasta"), "got: {err}");
+        assert!(
+            err.contains("a/aln.fasta") || err.contains("a\\aln.fasta"),
+            "got: {err}"
+        );
+        assert!(
+            err.contains("b/aln.fasta") || err.contains("b\\aln.fasta"),
+            "got: {err}"
+        );
         assert!(
             !err.contains("other.fasta"),
             "the non-colliding input is not the problem, got: {err}"
@@ -1210,16 +1222,19 @@ mod tests {
             Ok(()) => panic!("a file that fails to read must abort the run"),
             Err(e) => format!("{e:#}"),
         };
-        assert!(err.contains("ragged.fasta"), "the error must name the file, got: {err}");
         assert!(
-            !csv.exists(),
-            "no CSV should be written when phase 1 fails"
+            err.contains("ragged.fasta"),
+            "the error must name the file, got: {err}"
         );
+        assert!(!csv.exists(), "no CSV should be written when phase 1 fails");
 
         // And a file that does not exist at all.
         let missing_plan = parse(&["-o", &csv_arg, "test/test.fasta", "test/nope.fasta"])
             .expect("valid invocation");
-        assert!(run(&missing_plan).is_err(), "a missing file must abort the run");
+        assert!(
+            run(&missing_plan).is_err(),
+            "a missing file must abort the run"
+        );
 
         std::fs::remove_dir_all(&dir).expect("cleanup should succeed");
     }

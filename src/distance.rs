@@ -39,7 +39,7 @@
 //! agree with it.
 
 use crate::homology::{HomologyView, Registry};
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use colored::Colorize;
 use itertools::Itertools;
 use rayon::prelude::*;
@@ -129,7 +129,7 @@ pub fn compute_symmetric_difference(
 mod tests {
     use super::*;
     use crate::homology::homology_view;
-    use crate::msa::{read_msa, Msa};
+    use crate::msa::{Msa, read_msa};
 
     fn msa(records: &[(&str, &str)]) -> Msa {
         Msa::new(
@@ -169,7 +169,10 @@ mod tests {
         let backwards = distance_from_files("test/test2.fasta", "test/test.fasta")
             .expect("fixtures should compare");
 
-        assert_eq!(forwards, backwards, "the distance must not depend on argument order");
+        assert_eq!(
+            forwards, backwards,
+            "the distance must not depend on argument order"
+        );
     }
 
     #[test]
@@ -183,8 +186,14 @@ mod tests {
         let forwards = distance(&a, &b).expect("same name set");
         let backwards = distance(&b, &a).expect("same name set");
 
-        assert_eq!(forwards, backwards, "the distance must not depend on argument order");
-        assert_ne!(forwards, 0.0, "this pair should not be at distance 0; the test would be vacuous");
+        assert_eq!(
+            forwards, backwards,
+            "the distance must not depend on argument order"
+        );
+        assert_ne!(
+            forwards, 0.0,
+            "this pair should not be at distance 0; the test would be vacuous"
+        );
     }
 
     #[test]
@@ -277,10 +286,15 @@ mod tests {
         let b = msa(&[("x", "A-A-"), ("y", "A--A")]);
 
         let err = match distance(&a, &b) {
-            Ok(d) => panic!("alignments over different name sets must not produce a distance, got {d}"),
+            Ok(d) => {
+                panic!("alignments over different name sets must not produce a distance, got {d}")
+            }
             Err(e) => e.to_string(),
         };
-        assert!(err.contains("'z'"), "the error must name the missing sequence, got: {err}");
+        assert!(
+            err.contains("'z'"),
+            "the error must name the missing sequence, got: {err}"
+        );
 
         // Both directions, so neither ordering can sneak a number out.
         assert!(distance(&b, &a).is_err());
@@ -307,7 +321,10 @@ mod tests {
         let a = msa(&[("s1", "----"), ("s2", "----")]);
         let b = msa(&[("s1", "...."), ("s2", "----")]);
 
-        assert!(distance(&a, &b).is_err(), "a 0/0 ratio must be an error, not NaN");
+        assert!(
+            distance(&a, &b).is_err(),
+            "a 0/0 ratio must be an error, not NaN"
+        );
     }
 
     // -----------------------------------------------------------------------------

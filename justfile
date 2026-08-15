@@ -37,13 +37,12 @@ run *args="":
 test *args="":
     cargo test {{ args }}
 
-# Lints and tests — what CI should run. Both are clean as of 0.2.0.
+# Formatting, lints and tests — what CI should run. All three are clean as of 0.2.0.
 check:
+    cargo fmt --check
     cargo clippy -- -D warnings
     cargo test
 
-# Formats the tree. NOT part of `check`: the codebase predates rustfmt and has never
-# been run through it, so this reformats far more than whatever you are working on.
-# Worth doing as its own commit rather than folded into a change.
+# Formats the tree in place. Run this before `check` if it complains about formatting.
 fmt:
     cargo fmt

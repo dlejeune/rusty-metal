@@ -18,8 +18,8 @@
 //! `[sequence][residue position]`, with `None` meaning "this sequence has no residue at
 //! that position" (i.e. past its end).
 
-use crate::msa::{is_gap, Msa};
-use anyhow::{bail, Result};
+use crate::msa::{Msa, is_gap};
+use anyhow::{Result, bail};
 use std::collections::{HashMap, HashSet};
 
 /// One position in one sequence of an alignment: either a residue or a gap.
@@ -252,7 +252,10 @@ pub fn homology_view(msa: &Msa, registry: &Registry) -> Result<HomologyView> {
 
                 let seq_slot = seq_ids[row_idx] as usize;
                 let position_slot = position as usize;
-                match view.get_mut(seq_slot).and_then(|s| s.get_mut(position_slot)) {
+                match view
+                    .get_mut(seq_slot)
+                    .and_then(|s| s.get_mut(position_slot))
+                {
                     Some(slot) => *slot = Some(item_set),
                     // Unreachable: `seq_slot` came from the registry and `position` is
                     // an index among this row's residues, so it is < width. Handled
@@ -425,7 +428,10 @@ mod tests {
 
         let registry = Registry::for_pair(&a, &b).expect("same name set");
         let reversed = Registry::for_pair(&b, &a).expect("same name set");
-        assert_eq!(registry, reversed, "the registry must not depend on argument order");
+        assert_eq!(
+            registry, reversed,
+            "the registry must not depend on argument order"
+        );
 
         let view_a = homology_view(&a, &registry).expect("view a");
         let view_b = homology_view(&b, &registry).expect("view b");
@@ -471,7 +477,10 @@ mod tests {
             Ok(_) => panic!("alignments over different name sets must be rejected"),
             Err(e) => e.to_string(),
         };
-        assert!(err.contains("'z'"), "the error must name the missing sequence, got: {err}");
+        assert!(
+            err.contains("'z'"),
+            "the error must name the missing sequence, got: {err}"
+        );
         assert!(
             err.contains("only in the first"),
             "the error must say which side 'z' is on, got: {err}"
@@ -487,7 +496,10 @@ mod tests {
             Ok(_) => panic!("alignments over different name sets must be rejected"),
             Err(e) => e.to_string(),
         };
-        assert!(err.contains("'z'"), "the error must name the extra sequence, got: {err}");
+        assert!(
+            err.contains("'z'"),
+            "the error must name the extra sequence, got: {err}"
+        );
         assert!(
             err.contains("only in the second"),
             "the error must say which side 'z' is on, got: {err}"
@@ -507,7 +519,10 @@ mod tests {
         };
         assert!(err.contains("'only-a'"), "got: {err}");
         assert!(err.contains("'only-b'"), "got: {err}");
-        assert!(!err.contains("'shared'"), "shared names are not the problem, got: {err}");
+        assert!(
+            !err.contains("'shared'"),
+            "shared names are not the problem, got: {err}"
+        );
     }
 
     #[test]
@@ -534,7 +549,10 @@ mod tests {
             Ok(_) => panic!("a sequence outside the registry must be rejected"),
             Err(e) => e.to_string(),
         };
-        assert!(err.contains("'q'"), "the error must name the sequence, got: {err}");
+        assert!(
+            err.contains("'q'"),
+            "the error must name the sequence, got: {err}"
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -554,14 +572,22 @@ mod tests {
         let mut both: HashSet<Element> = HashSet::new();
         both.insert(residue_zero);
         both.insert(gap_after_residue_zero);
-        assert_eq!(both.len(), 2, "a residue and a gap must not collide in a homology set");
+        assert_eq!(
+            both.len(),
+            2,
+            "a residue and a gap must not collide in a homology set"
+        );
     }
 
     #[test]
     fn identity_distinguishes_sequence_and_position_but_not_the_character() {
         assert_ne!(residue(0, 0), residue(1, 0), "different sequences");
         assert_ne!(residue(0, 0), residue(0, 1), "different positions");
-        assert_ne!(gap(0, None), gap(0, Some(0)), "leading gap vs gap after residue 0");
+        assert_ne!(
+            gap(0, None),
+            gap(0, Some(0)),
+            "leading gap vs gap after residue 0"
+        );
         // Nothing in `Element` can express "an A" versus "a C" — that is the point.
         assert_eq!(residue(0, 0), residue(0, 0));
     }
@@ -700,4 +726,3 @@ mod tests {
         );
     }
 }
-
