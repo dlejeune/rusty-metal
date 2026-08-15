@@ -1,141 +1,358 @@
-use crate::datastructures::{IsGap, MsaHashSets, MultipleSequenceAlignment, SequenceElement};
-use anyhow::Result;
+//! The symmetric-difference distance between two alignments.
+//!
+//! Given two [`HomologyView`]s built against one shared [`Registry`], the distance is
+//!
+//! ```text
+//!            sum over residues r of  |A(r) Δ B(r)|
+//!   d(a,b) = ---------------------------------------
+//!            sum over residues r of  |A(r)| + |B(r)|
+//! ```
+//!
+//! where `A(r)` is the set of elements sharing `r`'s column in alignment `a`, and `B(r)`
+//! the same in `b`. Both sums range over the residues that exist in *both* views — a
+//! `None` slot means "this sequence has no residue at that position", i.e. past the end
+//! of its residues, and contributes nothing to either sum.
+//!
+//! # What changed in Stage 4
+//!
+//! Two things, both from `CODE_REVIEW.md` §0:
+//!
+//! - **The iteration bound is `registry.len()`**, not the first alignment's sequence
+//!   count. `main.rs` used to pass `msa_a.num_seqs`, so a comparison against an
+//!   alignment with more sequences was silently computed over a truncated overlap and
+//!   `d(a, b) != d(b, a)`. [`Registry::for_pair`] now rejects mismatched name sets
+//!   outright, so the sequence dimension is shared by construction.
+//! - **The denominator is `|A| + |B|`**, not `2·|A|`. Taking both counts from the A side
+//!   made the ratio depend on which alignment was passed first whenever the two sides'
+//!   set sizes could differ.
+//!
+//! Worth writing down, because it is not obvious and it is the kind of thing that looks
+//! like a bug later: on any pair that gets this far, **the two denominators are equal**.
+//! A residue's homology set is its whole column minus itself, and every element in a
+//! column carries a distinct `seq`, so no two collapse in the hash set and
+//! `|A(r)| = |B(r)| = num_seqs - 1` for *every* residue. The registry has already
+//! forced both alignments to the same sequence count. So the fix is numerically inert
+//! today and only bites once the two sides' set sizes can genuinely differ — which is
+//! exactly what the deferred change in `CODE_REVIEW.md` §2 (a shared per-column set with
+//! a remove-self view, or any move to a residues-only / gap-filtered set) would
+//! introduce. `|A| + |B|` is the definition of the metric; `2·|A|` merely happened to
+//! agree with it.
+
+use crate::homology::{HomologyView, Registry};
+use anyhow::{bail, Result};
 use colored::Colorize;
 use itertools::Itertools;
-use log::log;
 use rayon::prelude::*;
-use std::collections::HashSet;
 
-fn compute_jaccard_distance(homology_set_a: &MsaHashSets, homology_set_b: &MsaHashSets) -> f32 {
-    let mut union_sum: usize = 0;
-    let mut intersection_sum: usize = 0;
-    for seq_idx in 0..homology_set_a.len() {
-        let mut seq_element_idx = 0;
-        while let Some(element_homology_set_a) = &homology_set_a[seq_idx][seq_element_idx].clone() {
-            let element_homology_set_b = &homology_set_b[seq_idx][seq_element_idx].clone().unwrap();
-            union_sum += element_homology_set_a.union(element_homology_set_b).count();
-            intersection_sum += element_homology_set_a
-                .intersection(element_homology_set_b)
-                .count();
-            seq_element_idx += 1;
-        }
-    }
-    println!("{}/{}", intersection_sum, union_sum);
-    1f32 - (intersection_sum as f32) / (union_sum as f32)
+/// The per-residue contribution to the distance: one symmetric-difference count and the
+/// two set sizes that go under the line.
+struct ResidueContribution {
+    /// `|A Δ B|` — the numerator's share.
+    symmetric_difference: usize,
+    /// `|A| + |B|` — the denominator's share.
+    set_sizes: usize,
 }
 
+/// The symmetric-difference distance between two homology views built against
+/// `registry`.
+///
+/// Returns `Err` if the two views have no residues in common to compare — a pair of
+/// single-sequence alignments (where every homology set is empty), or alignments made
+/// entirely of gaps. The ratio is `0/0` there; the old code returned `NaN`, which would
+/// be written into the CSV as a confident-looking result.
 pub fn compute_symmetric_difference(
-    homology_set_a: &MsaHashSets,
-    homology_set_b: &MsaHashSets,
-    length: usize,
-    width: usize,
+    view_a: &HomologyView,
+    view_b: &HomologyView,
+    registry: &Registry,
 ) -> Result<f64> {
     log::info!("{}", "Computing Symmetric Difference".bold().purple());
 
-    struct SymmetricDistanceResult {
-        distance: usize,
-        homology_set_size: usize,
-    }
-    // Note: the reason why we may sometimes fail to get a column or a hashset is because
-    // the hashset vectors are pre-populated by None values before hand. getting a None element
-    // hashet is indicative of reaching the end of the sequence.
-    // Getting a none hashset on the column is because we iterate over the width of the longest MSA
-    // which will always be longer than the sequences (or at least the same size).
-    let symmetric_distances: Vec<Option<SymmetricDistanceResult>> = (0..length)
+    // Both views are indexed by registry index and sized by `registry.len()`, so the
+    // sequence dimension needs no reconciling. The residue dimension is each
+    // alignment's own width, which may differ between the two; take the larger and let
+    // `get` return `None` past the end of the shorter.
+    let width = view_a
+        .iter()
+        .chain(view_b.iter())
+        .map(|sequence_slots| sequence_slots.len())
+        .max()
+        .unwrap_or(0);
+
+    // A `None` here means the slot pair contributed nothing: at least one of the two
+    // sequences has no residue at this position. That is the ordinary case for every
+    // position past a sequence's residue count, not an error.
+    let contributions: Vec<Option<ResidueContribution>> = (0..registry.len())
         .cartesian_product(0..width)
         .par_bridge()
-        .map(|(x, y)| {
-            if let (Some(sequence_homology_sets_a), Some(sequence_homology_sets_b)) =
-                (homology_set_a.get(x), &homology_set_b.get(x))
-            {
-                if let (Some(column_homology_sets_a), Some(column_homology_sets_b)) = (
-                    sequence_homology_sets_a.get(y),
-                    sequence_homology_sets_b.get(y),
-                ) {
-                    if let (Some(element_homology_set_a), Some(element_homology_set_b)) =
-                        (column_homology_sets_a, column_homology_sets_b)
-                    {
-                        Some(SymmetricDistanceResult {
-                            distance: element_homology_set_a
-                                .symmetric_difference(element_homology_set_b)
-                                .count(),
-                            homology_set_size: element_homology_set_a.len(),
-                        })
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                log::warn!("The sequence with id {x} failed to be found in this hashset.");
-                None
-            }
+        .map(|(sequence, position)| {
+            // Note there is no fallback arm reporting a missing sequence here. The old
+            // code logged a warning in that position claiming the sequence was absent
+            // from the hash set; it could not fire for the stated reason (the index was
+            // bounded by A's own length), it fired once per column when it did fire, and
+            // `Registry::for_pair` now makes a genuinely missing sequence impossible.
+            let slot_a = view_a.get(sequence)?.get(position)?.as_ref()?;
+            let slot_b = view_b.get(sequence)?.get(position)?.as_ref()?;
+
+            Some(ResidueContribution {
+                symmetric_difference: slot_a.symmetric_difference(slot_b).count(),
+                set_sizes: slot_a.len() + slot_b.len(),
+            })
         })
         .collect();
 
-    let total_distance: usize = symmetric_distances
-        .iter()
-        .map(|d| match d {
-            Some(d) => d.distance,
-            None => 0,
-        })
-        .sum();
-    let total_length: usize = symmetric_distances
-        .iter()
-        .map(|d| match d {
-            Some(d) => d.homology_set_size * 2,
-            None => 0,
-        })
-        .sum();
-    // let total_chars = homology_set_a.iter()
-    // let mut symmetric_difference_sum = 0;
-    // let mut num_chars = 0;
-    // let mut symmetric_diff_seqs: Vec<f64> = Vec::with_capacity(homology_set_a.len());
-    //
-    // for seq_idx in 0..homology_set_a.len() {
-    //     let mut seq_dist = 0;
-    //     let mut seq_dist_sum = 0;
-    //     let mut seq_dist_total_chars = 0;
-    //     let mut seq_element_idx = 0;
-    //
-    //     while let (Some(next_hom_set_a), Some(next_hom_set_b)) = (
-    //         homology_set_a[seq_idx].get(seq_element_idx),
-    //         homology_set_b[seq_idx].get(seq_element_idx),
-    //     ) {
-    //         if let (Some(element_homology_set_a), Some(element_homology_set_b)) =
-    //             (next_hom_set_a, next_hom_set_b)
-    //         {
-    //             seq_dist = element_homology_set_a
-    //                 .symmetric_difference(element_homology_set_b)
-    //                 .count();
-    //
-    //             seq_dist_sum += seq_dist;
-    //
-    //             seq_dist_total_chars += 2 * element_homology_set_a.len();
-    //             seq_element_idx += 1;
-    //         } else {
-    //             break;
-    //         }
-    //     }
-    //     symmetric_difference_sum += seq_dist_sum;
-    //     num_chars += seq_dist_total_chars;
-    //     symmetric_diff_seqs.push((seq_dist as f64) / (seq_dist_total_chars as f64));
-    //     // log::info!(
-    //     //     "Seq {}: {}/{} = {}",
-    //     //     seq_idx,
-    //     //     seq_dist_sum,
-    //     //     seq_dist_total_chars,
-    //     //     seq_dist_sum as f64 / seq_dist_total_chars as f64,
-    //     // )
-    // }
-    // let distance = (symmetric_difference_sum as f64) / (num_chars as f64);
-    let distance: f64 = (total_distance as f64) / (total_length as f64);
-    // log::info!(
-    //     "{}",
-    //     format!("{}/{} = {}", total_distance, total_length, distance)
-    //         .bold()
-    //         .green()
-    // );
+    let (numerator, denominator) = contributions.iter().flatten().fold(
+        (0usize, 0usize),
+        |(numerator, denominator), contribution| {
+            (
+                numerator + contribution.symmetric_difference,
+                denominator + contribution.set_sizes,
+            )
+        },
+    );
+
+    if denominator == 0 {
+        bail!(
+            "The two alignments have no comparable residues: every homology set is empty, \
+             so the distance would be 0/0. This happens when the alignments hold a single \
+             sequence each (a residue's homology set is its column minus itself), or when \
+             they contain nothing but gaps."
+        );
+    }
+
+    let distance = (numerator as f64) / (denominator as f64);
+    log::debug!("Symmetric difference: {numerator}/{denominator} = {distance}");
+
     Ok(distance)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::homology::homology_view;
+    use crate::msa::{read_msa, Msa};
+
+    fn msa(records: &[(&str, &str)]) -> Msa {
+        Msa::new(
+            records.iter().map(|(n, _)| n.to_string()).collect(),
+            records.iter().map(|(_, r)| r.as_bytes().to_vec()).collect(),
+        )
+        .expect("test fixture should be a valid Msa")
+    }
+
+    /// The whole pipeline for one pair of in-memory alignments, as `main.rs` runs it.
+    fn distance(a: &Msa, b: &Msa) -> Result<f64> {
+        let registry = Registry::for_pair(a, b)?;
+        let view_a = homology_view(a, &registry)?;
+        let view_b = homology_view(b, &registry)?;
+        compute_symmetric_difference(&view_a, &view_b, &registry)
+    }
+
+    /// The same, from two FASTA paths.
+    fn distance_from_files(path_a: &str, path_b: &str) -> Result<f64> {
+        let a = read_msa(path_a)?;
+        let b = read_msa(path_b)?;
+        distance(&a, &b)
+    }
+
+    // -----------------------------------------------------------------------------
+    // The property the denominator fix exists for
+    // -----------------------------------------------------------------------------
+
+    #[test]
+    fn the_distance_is_symmetric_on_the_fixture_pair() {
+        // `d(a, b) == d(b, a)` — exactly, as `f64` bits, not to within a tolerance.
+        // Before Stage 4 this could not be relied on: the iteration ran over A's
+        // sequence count and the denominator counted A's sets twice, so swapping the
+        // arguments swapped which alignment defined both bounds (`CODE_REVIEW.md` §0).
+        let forwards = distance_from_files("test/test.fasta", "test/test2.fasta")
+            .expect("fixtures should compare");
+        let backwards = distance_from_files("test/test2.fasta", "test/test.fasta")
+            .expect("fixtures should compare");
+
+        assert_eq!(forwards, backwards, "the distance must not depend on argument order");
+    }
+
+    #[test]
+    fn the_distance_is_symmetric_for_differing_gap_patterns() {
+        // A second pair, chosen so the two alignments disagree about gap placement in
+        // every row rather than in one, and so the two rows have different residue
+        // counts (2 and 3). Same requirement: exact equality both ways round.
+        let a = msa(&[("s1", "A-C--"), ("s2", "AC-G-"), ("s3", "-A-CG")]);
+        let b = msa(&[("s1", "--A-C"), ("s2", "-ACG-"), ("s3", "AC--G")]);
+
+        let forwards = distance(&a, &b).expect("same name set");
+        let backwards = distance(&b, &a).expect("same name set");
+
+        assert_eq!(forwards, backwards, "the distance must not depend on argument order");
+        assert_ne!(forwards, 0.0, "this pair should not be at distance 0; the test would be vacuous");
+    }
+
+    #[test]
+    fn registry_order_does_not_change_the_distance() {
+        // The mechanism: `Registry::for_pair` is itself argument-order independent, so
+        // both directions of the test above are computed against the identical registry.
+        let a = msa(&[("s1", "A-C--"), ("s2", "AC-G-"), ("s3", "-A-CG")]);
+        let b = msa(&[("s1", "--A-C"), ("s2", "-ACG-"), ("s3", "AC--G")]);
+
+        assert_eq!(
+            Registry::for_pair(&a, &b).expect("same name set"),
+            Registry::for_pair(&b, &a).expect("same name set")
+        );
+    }
+
+    // -----------------------------------------------------------------------------
+    // Pinned values
+    // -----------------------------------------------------------------------------
+
+    #[test]
+    fn the_fixture_pair_distance_is_hand_verified() {
+        // test/test.fasta      test/test2.fasta
+        // >1 AA--              >1 A-A-
+        // >2 A--A              >2 A--A
+        // >3 AAA-              >3 AAA-
+        //
+        // Registry is sorted by name: "1" -> 0, "2" -> 1, "3" -> 2. Writing r(s,p) for a
+        // residue and g(s,p) for a gap (a gap's position is the index of the residue
+        // preceding it in its row):
+        //
+        //   seq pos | A(r)                  | B(r)                  | |AΔB| | |A|+|B|
+        //   --------+-----------------------+-----------------------+-------+--------
+        //   0   0   | {r(1,0), r(2,0)}      | {r(1,0), r(2,0)}      |   0   |   4
+        //   0   1   | {g(1,0), r(2,1)}      | {g(1,0), r(2,2)}      |   2   |   4
+        //   1   0   | {r(0,0), r(2,0)}      | {r(0,0), r(2,0)}      |   0   |   4
+        //   1   1   | {g(0,1), g(2,2)}      | {g(0,1), g(2,2)}      |   0   |   4
+        //   2   0   | {r(0,0), r(1,0)}      | {r(0,0), r(1,0)}      |   0   |   4
+        //   2   1   | {r(0,1), g(1,0)}      | {g(0,0), g(1,0)}      |   2   |   4
+        //   2   2   | {g(0,1), g(1,0)}      | {r(0,1), g(1,0)}      |   2   |   4
+        //   --------+-----------------------+-----------------------+-------+--------
+        //                                                       sum:   6        28
+        //
+        // 6 / 28 = 3/14 = 0.21428571428571427.
+        //
+        // This is the *same* number the pre-merge binary emitted under the old `2·|A|`
+        // denominator, and that is not a coincidence: |A| = |B| = num_seqs - 1 = 2 in
+        // every row of the table, so 2·|A| and |A| + |B| agree term for term. Numerator
+        // 6 and denominator 28 are unchanged. See the module docs for why that holds in
+        // general, and for the change that would break it.
+        let distance = distance_from_files("test/test.fasta", "test/test2.fasta")
+            .expect("fixtures should compare");
+        assert_eq!(distance, 0.21428571428571427);
+    }
+
+    #[test]
+    fn an_alignment_against_itself_is_exactly_zero() {
+        let m = read_msa("test/test.fasta").expect("fixture should read");
+        assert_eq!(distance(&m, &m).expect("same name set"), 0.0);
+    }
+
+    #[test]
+    fn reordered_records_give_exactly_zero() {
+        // `test/test_reordered.fasta` is `test/test.fasta` with the records written
+        // 2, 1, 3. Same alignment, so distance 0. The old positional keying reported
+        // 0.5714285714285714 here (`CODE_REVIEW.md` §0).
+        assert_eq!(
+            distance_from_files("test/test.fasta", "test/test_reordered.fasta")
+                .expect("fixtures should compare"),
+            0.0
+        );
+        // And in the other direction, since that is the whole point of this stage.
+        assert_eq!(
+            distance_from_files("test/test_reordered.fasta", "test/test.fasta")
+                .expect("fixtures should compare"),
+            0.0
+        );
+    }
+
+    // -----------------------------------------------------------------------------
+    // Errors rather than wrong numbers
+    // -----------------------------------------------------------------------------
+
+    #[test]
+    fn a_mismatched_name_set_errs_end_to_end() {
+        // Previously this produced a number: the iteration ran to A's sequence count and
+        // the missing sequences were simply skipped, giving d(3-seq, 2-seq) = 0.25 and
+        // d(2-seq, 3-seq) = 0.5 for the same pair. The failure has to surface as an
+        // `Err`, and it has to surface from the same entry point `main.rs` calls.
+        let a = msa(&[("x", "AA--"), ("y", "A--A"), ("z", "AAA-")]);
+        let b = msa(&[("x", "A-A-"), ("y", "A--A")]);
+
+        let err = match distance(&a, &b) {
+            Ok(d) => panic!("alignments over different name sets must not produce a distance, got {d}"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("'z'"), "the error must name the missing sequence, got: {err}");
+
+        // Both directions, so neither ordering can sneak a number out.
+        assert!(distance(&b, &a).is_err());
+    }
+
+    #[test]
+    fn an_undefined_ratio_errs_rather_than_returning_nan() {
+        // One sequence per alignment: a residue's homology set is its column minus
+        // itself, so every set is empty and the ratio is 0/0. The old code divided
+        // anyway and returned NaN, which `main.rs` would have written to the CSV.
+        let a = msa(&[("only", "AC-G")]);
+        let b = msa(&[("only", "A-CG")]);
+
+        assert!(
+            distance(&a, &b).is_err(),
+            "a 0/0 ratio must be an error, not NaN"
+        );
+    }
+
+    #[test]
+    fn all_gap_alignments_err_rather_than_returning_nan() {
+        // No residues at all, so no slot is ever `Some` and the denominator is 0 for a
+        // different reason than the test above.
+        let a = msa(&[("s1", "----"), ("s2", "----")]);
+        let b = msa(&[("s1", "...."), ("s2", "----")]);
+
+        assert!(distance(&a, &b).is_err(), "a 0/0 ratio must be an error, not NaN");
+    }
+
+    // -----------------------------------------------------------------------------
+    // Shape handling
+    // -----------------------------------------------------------------------------
+
+    #[test]
+    fn alignments_of_different_widths_compare_over_the_shared_residues() {
+        // Same sequences, same residues, padded to different widths. Positions are
+        // indexed among a row's *residues*, not its columns, so the extra trailing gap
+        // columns add no residues and the two are at distance 0 — but only if the
+        // iteration covers the wider view's slots without indexing past the narrower.
+        let narrow = msa(&[("s1", "AC"), ("s2", "AC")]);
+        let wide = msa(&[("s1", "AC---"), ("s2", "AC---")]);
+
+        assert_eq!(distance(&narrow, &wide).expect("same name set"), 0.0);
+        assert_eq!(distance(&wide, &narrow).expect("same name set"), 0.0);
+    }
+
+    #[test]
+    fn every_homology_set_has_size_num_seqs_minus_one() {
+        // The invariant the module docs lean on, pinned: it is what makes `2·|A|` and
+        // `|A| + |B|` agree today, so if it ever stops holding, the fixture value above
+        // is expected to move and this test says why.
+        let m = msa(&[("a", "A-BC-"), ("b", "-AB-C"), ("c", "AB-C-")]);
+        let registry = Registry::for_pair(&m, &m).expect("same name set");
+        let view = homology_view(&m, &registry).expect("view should build");
+
+        for sequence_slots in &view {
+            for slot in sequence_slots.iter().flatten() {
+                assert_eq!(
+                    slot.len(),
+                    m.num_seqs() - 1,
+                    "a residue's homology set is its column minus itself"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn case_only_differences_do_not_change_the_distance() {
+        // Identity excludes the raw byte, so this is 0 without any normalisation pass.
+        let upper = msa(&[("s1", "AC-G"), ("s2", "A-CG")]);
+        let lower = msa(&[("s1", "ac-g"), ("s2", "a-cg")]);
+
+        assert_eq!(distance(&upper, &lower).expect("same name set"), 0.0);
+    }
 }

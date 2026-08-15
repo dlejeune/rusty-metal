@@ -1,6 +1,6 @@
 #!/usr/bin/env just --justfile
 
-latest-tag := "0.1.0"
+latest-tag := "0.2.0"
 image-name := "dlejeune/pipeline-utils-rs"
 
 default:
@@ -30,3 +30,18 @@ build:
 
 run *args="":
     cargo run -- {{ args }}
+
+# Runs the test suite
+test *args="":
+    cargo test {{ args }}
+
+# Lints and tests — what CI should run. Both are clean as of 0.2.0.
+check:
+    cargo clippy -- -D warnings
+    cargo test
+
+# Formats the tree. NOT part of `check`: the codebase predates rustfmt and has never
+# been run through it, so this reformats far more than whatever you are working on.
+# Worth doing as its own commit rather than folded into a change.
+fmt:
+    cargo fmt
