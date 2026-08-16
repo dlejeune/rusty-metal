@@ -4,7 +4,7 @@
 # `rusty-metAL` is the display name, and appears in help output, the startup banner and
 # the README. See `DISPLAY_NAME` in `src/main.rs`.
 name = "rusty-metal"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2024"
 authors = ["Daniel Le Jeune"]
 license-file = "LICENSE"

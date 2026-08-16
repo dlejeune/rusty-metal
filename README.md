@@ -74,6 +74,11 @@ Note that standardisation moves each alignment to _its own_ canonical layout. It
 move two genuinely different alignments toward each other, so a distance between two
 different alignments can go either up or down relative to not standardising.
 
+## Installation
+
+Binaries and installer scripts can be found in the [Releases](https://github.com/dlejeune/rusty-metal/releases) tab on GitHub.
+Alternatively, rusty-metAL can be built from scratch (see [Development](#development))
+
 ## Usage
 
 ```
