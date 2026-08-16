@@ -3,48 +3,32 @@
 //! residue hash that no residue content moved relative to any other residue in its own
 //! row.
 //!
-//! The result is a genuine canonical form. Two alignments differing only by a legal
-//! column permutation standardise to byte-identical output, which is the property the
-//! distance metric relies on and the reason this stage exists.
+//! The result is a canonical form. Two alignments differing only by a legal column
+//! permutation standardise to byte-identical output, which is the property the distance
+//! metric relies on and the reason this stage exists.
 //!
-//! Originally ported from the standalone `standardise-msa` tool (`src/main.rs` @
-//! `97978c9`), re-expressed over the shared [`Msa`] type: the original transposed the
-//! alignment into a `Vec<Column>` and bubble-sorted that, where this works over column
-//! *indices* and reads through into the rows, avoiding a second full copy of every
-//! alignment (see `CODE_REVIEW.md` §2 — the crate already has a memory ceiling and
-//! cannot afford another one).
-//!
-//! The ordering rule itself is **no longer the original's**. See
-//! [`canonical_columns`]: the original's comparator was inverted relative to its own
-//! stated intent, keyed on a single number that tied constantly, and — being a sort
-//! over a non-transitive relation — did not determine a unique answer at all. It is
-//! replaced by a canonical topological construction. This is a deliberate,
-//! output-changing divergence, recorded in `INTEGRATION_NOTES.md` under Stage 6.
+//! The pass works over column *indices* and reads through into the rows, so it does not
+//! build a transposed copy of the alignment alongside the original.
 //!
 //! # Why standardisation changes the metric
 //!
-//! The distance treats a gap's identity as "the index of the residue preceding it in
-//! its row". Permuting columns moves residues within a row, so the same gap acquires a
-//! different identity, hence different homology sets. Residues themselves are never
-//! affected, because [`canonical_columns`] never moves one column past another when
-//! both hold a residue in the same row — which is precisely the invariant
-//! [`Msa::residue_hash`] verifies. Standardising both inputs therefore strips
-//! gap-placement artefacts out of the distance.
+//! The distance treats a gap's identity as the index of the residue preceding it in its
+//! row. Permuting columns moves residues within a row, so the same gap acquires a
+//! different identity and therefore a different homology set. Residues are unaffected,
+//! because [`canonical_columns`] never moves one column past another when both hold a
+//! residue in the same row — the invariant [`Msa::residue_hash`] verifies. Standardising
+//! both inputs therefore strips gap-placement artefacts out of the distance.
 //!
-//! # Intentional divergences from the original
+//! # Rules
 //!
-//! - The original hard-coded `const GAP: u8 = b'-'` and treated `.` as a residue. This
-//!   uses the shared [`is_gap`], which counts both `-` and `.` (`CODE_REVIEW.md` §3):
-//!   `.` is a real gap character in Pfam-derived FASTA, and the two tools previously
-//!   disagreed about it.
-//! - The column ordering rule is replaced outright; see [`canonical_columns`].
-//! - All-gap columns are **dropped** rather than retained. The original pinned them in
-//!   place — despite a comment claiming the opposite — so a column carrying no residue
-//!   at all could still hold the rest of the alignment apart. A column of pure gaps
-//!   states no homology relationship, so it is removed.
+//! - Both `-` and `.` count as gaps, through the shared [`is_gap`]. `.` is a real gap
+//!   character in Pfam-derived FASTA.
+//! - Columns are ordered by the canonical construction in [`canonical_columns`].
+//! - All-gap columns are dropped. A column of pure gaps states no homology relationship,
+//!   so leaving it in place would let it hold the rest of the alignment apart.
 //!
-//! Output is therefore **not** byte-compatible with `standardise-msa`, and distances
-//! computed after standardisation differ from those of any earlier build of this crate.
+//! Output is not byte-compatible with the `standardise-msa` tool, and distances computed
+//! after standardisation differ from those of `0.1.x`.
 
 use crate::msa::{Msa, is_gap};
 use anyhow::{Context, Result, bail};
@@ -55,16 +39,15 @@ use std::hash::{Hash, Hasher};
 /// Whether two columns are **pinned**: whether they are forbidden from moving past
 /// each other.
 ///
-/// Two columns are pinned when any row holds a residue in *both* of them: swapping
-/// would reverse those two residues within that row and corrupt the sequence. That is
-/// the whole of the rule — see `canonical_columns` for what replaced the original
-/// tool's four other branches.
+/// Two columns are pinned when any row holds a residue in *both* of them: swapping would
+/// reverse those two residues within that row and corrupt the sequence. That is the whole
+/// of the rule.
 ///
-/// **This predicate is not an equivalence relation and is deliberately
-/// non-transitive.** A may be movable past B, and B past C, while A is pinned against
-/// C — a residue in a row that A and C share but B does not is enough. It is a
-/// precedence constraint, not an ordering, which is why `canonical_columns` treats it
-/// as a DAG rather than handing it to a sort.
+/// **This predicate is not an equivalence relation, and it is non-transitive.** A may be
+/// movable past B, and B past C, while A is pinned against C — a residue in a row that A
+/// and C share but B does not is enough. It is a precedence constraint rather than an
+/// ordering, which is why `canonical_columns` treats it as a DAG rather than handing it
+/// to a sort.
 fn columns_are_pinned(msa: &Msa, a: usize, b: usize) -> bool {
     msa.rows()
         .iter()
@@ -81,8 +64,7 @@ fn column_is_all_gaps(msa: &Msa, col: usize) -> bool {
 /// higher-numbered rows further to the left.
 ///
 /// Compared lazily row by row rather than by materialising a key per column, so this
-/// allocates nothing and the whole pass stays within the O(width) extra memory the
-/// crate can afford (`CODE_REVIEW.md` §2).
+/// allocates nothing and the pass as a whole needs only O(width) extra memory.
 fn compare_columns(msa: &Msa, a: usize, b: usize) -> Ordering {
     for row in msa.rows().iter() {
         // `false` (residue) sorts before `true` (gap).
@@ -107,26 +89,22 @@ fn compare_columns(msa: &Msa, a: usize, b: usize) -> Ordering {
 ///
 /// *** DO NOT REPLACE THIS WITH `sort_by`, `sort_unstable_by`, OR A BUBBLE SORT. ***
 ///
-/// The original tool bubble-sorted columns under a comparator that returned `Equal`
-/// for a pinned pair. That is not merely a violation of the total-order contract that
-/// `sort_by` requires — it does not determine an answer at all. When a column is free
-/// to sit in several places (movable past both of two columns that are pinned to each
-/// other), a comparator has nothing to say about which place is canonical, and a sort
-/// that only swaps adjacent pairs simply leaves the column wherever the input file
-/// happened to put it.
+/// Sorting columns under a comparator that returns `Equal` for a pinned pair violates
+/// the total-order contract `sort_by` requires, and, worse, does not determine an answer
+/// at all. When a column is free to sit in several places — movable past both of two
+/// columns that are pinned to each other — a comparator has nothing to say about which
+/// place is canonical, and a sort that only swaps adjacent pairs leaves the column
+/// wherever the input file happened to put it.
 ///
-/// The consequence was that standardisation **was not confluent**: two files holding
-/// the same alignment, differing only by a legal column permutation, standardised to
-/// different layouts and compared as different. Measured over random alignments, 78%
-/// of legal column shuffles changed the standardised layout and 36% produced a nonzero
-/// distance between an alignment and itself, up to the maximum of 1.0. That defeats
-/// the entire purpose of standardising.
+/// Standardisation would then not be confluent: two files holding the same alignment,
+/// differing only by a legal column permutation, would standardise to different layouts
+/// and compare as different, which is the one thing this pass exists to prevent.
 ///
-/// The fix is to *construct* the order rather than sort into it. The pinning relation
-/// is a property of the columns themselves, and a legal permutation never reorders a
-/// pinned pair, so the precedence DAG is identical no matter which legal permutation
-/// of an alignment we are handed. Emitting the smallest available column under a total
-/// key therefore depends only on that DAG — the result is confluent by construction.
+/// So the order is *constructed* rather than sorted into. The pinning relation is a
+/// property of the columns themselves and a legal permutation never reorders a pinned
+/// pair, so the precedence DAG is identical whichever legal permutation of an alignment
+/// is handed in. Emitting the smallest available column under a total key therefore
+/// depends only on that DAG, and the result is confluent by construction.
 /// `standardisation_is_confluent_over_legal_permutations` is the property test.
 ///
 /// # Why the key never ties
@@ -139,8 +117,7 @@ fn compare_columns(msa: &Msa, a: usize, b: usize) -> Ordering {
 /// among the available columns is always unique, and no tiebreak is needed.
 /// `available_columns_never_tie` pins that argument.
 ///
-/// Known cost: O(width^2 * num_seqs), the same as the bubble sort it replaces, in
-/// O(width) extra memory.
+/// Costs O(width^2 * num_seqs) time in O(width) extra memory.
 pub fn canonical_columns(msa: &Msa) -> Vec<usize> {
     // All-gap columns carry no alignment information: no residue sits in one, so no
     // homology relationship depends on where it is. Keeping them would mean the
@@ -209,29 +186,27 @@ fn residue_multiset_digest(msa: &Msa) -> u64 {
 /// Standardises an alignment in place: sorts the sequences by name, then rewrites the
 /// columns into canonical order, dropping any that hold no residue.
 ///
-/// The result is a genuine canonical form: any two alignments that differ only by a
-/// legal column permutation standardise to byte-identical output.
+/// The result is a canonical form: any two alignments that differ only by a legal column
+/// permutation standardise to byte-identical output.
 ///
 /// Returns `Err` if the operation altered any residue content. Two checks bracket the
 /// work, for the reason described on [`residue_multiset_digest`]:
 ///
-/// - `residue_hash` before and after the *column rewrite*. This is the original tool's
-///   check, and the one that matters: it is what proves the ordering only ever made
-///   legal moves. It covers column dropping too — `residue_hash` filters gaps out, so
-///   discarding an all-gap column leaves it untouched, while discarding a column that
-///   held a residue would change it and be caught.
-/// - an order-independent digest before and after the *whole* operation, so the sort
-///   by name is covered too. Sorting moves whole `(name, row)` pairs, so this can only
-///   fire if `sort_sequences_by_name` is ever broken — which is the point of having it.
+/// - `residue_hash` before and after the *column rewrite*, which is what shows the
+///   ordering only ever made legal moves. It covers column dropping too: `residue_hash`
+///   filters gaps out, so discarding an all-gap column leaves it untouched, while
+///   discarding a column that held a residue changes it.
+/// - an order-independent digest before and after the *whole* operation, so the sort by
+///   name is covered as well. Sorting moves whole `(name, row)` pairs, so this fires only
+///   if `sort_sequences_by_name` is broken.
 pub fn standardise(msa: &mut Msa) -> Result<()> {
     let digest_before = residue_multiset_digest(msa);
 
     msa.sort_sequences_by_name();
 
-    // Taken *after* the sort, matching the original, which hashed once the sequences
-    // were already in name order. `residue_hash` is order-dependent, so a hash taken
-    // before the sort would differ from the one after for any input that was not
-    // already sorted, and standardisation would reject its own legal work.
+    // Taken *after* the sort. `residue_hash` is order-dependent, so a hash taken before
+    // the sort would differ from the one after for any input that was not already in
+    // name order, and standardisation would reject its own legal work.
     let hash_before_columns = msa.residue_hash();
 
     let order = canonical_columns(msa);
@@ -365,18 +340,9 @@ mod tests {
 
     #[test]
     fn all_gap_columns_are_dropped() {
-        // *** DELIBERATE CHANGE FROM THE ORIGINAL TOOL (Stage 6). ***
-        //
-        // The original pinned all-gap columns, so they never moved — despite a comment
-        // claiming "we can move it around". Verified against the built original at
-        // `97978c9`, which emitted this input completely unchanged:
-        //
-        //     in:  >a A--   out:  >a A--
-        //          >b --B         >b --B
-        //
         // A column holding no residue states no homology relationship, so keeping it
-        // let a column that says nothing hold the rest of the alignment apart. It is
-        // now removed entirely and the width shrinks.
+        // would let a column that says nothing hold the rest of the alignment apart. It
+        // is removed entirely and the width shrinks.
         let mut m = msa(&[("a", "A--"), ("b", "--B")]);
         standardise(&mut m).expect("standardisation should succeed");
 
@@ -390,9 +356,9 @@ mod tests {
 
     #[test]
     fn an_all_gap_alignment_standardises_to_zero_width() {
-        // The limit case of dropping: nothing survives. Left representable rather than
-        // rejected — `Msa::select_columns` documents why, and the distance stage
-        // already reports an empty comparison as an error.
+        // The limit case of dropping: nothing survives. A zero-width alignment stays
+        // representable rather than being rejected here; `Msa::select_columns` documents
+        // why, and the distance stage reports an empty comparison as an error.
         let mut m = msa(&[("a", "---"), ("b", "---")]);
         standardise(&mut m).expect("standardisation should succeed");
 
@@ -406,11 +372,8 @@ mod tests {
         // `[-, B]`; no row holds a residue in both, so they are free to move.
         //
         // Row `a` is the higher row and it has its residue in column 0, so column 0
-        // sorts first and the alignment is already canonical.
-        //
-        // *** The original tool emitted `-A` / `B-` here — the exact mirror image. ***
-        // It keyed on the row index of the first *gap*, ascending, so a column with a
-        // residue up top sorted last. That was inverted relative to its intent.
+        // sorts first and the alignment is already canonical. The mirror layout,
+        // `-A` / `B-`, is not canonical and must be rewritten to this one.
         let mut m = msa(&[("a", "A-"), ("b", "-B")]);
         standardise(&mut m).expect("standardisation should succeed");
 
@@ -447,9 +410,6 @@ mod tests {
 
     #[test]
     fn the_test_fixture_standardises_to_its_canonical_form() {
-        // *** CHANGED IN STAGE 6. *** `test/test.fasta` used to be a fixed point: the
-        // original tool emitted it unchanged, and this test asserted a no-op.
-        //
         //   input          columns          canonical order [0, 1, 3, 2]
         //   1  AA--        c0 = (A,A,A)     1  AA--
         //   2  A--A        c1 = (A,-,A)     2  A-A-
@@ -470,15 +430,9 @@ mod tests {
 
     #[test]
     fn the_test2_fixture_standardises_to_its_canonical_form() {
-        // *** CHANGED IN STAGE 6. *** This was the port's regression gate against the
-        // built `standardise-msa` binary at `97978c9`, which emitted:
-        //
-        //     >1 A--A   >2 A-A-   >3 AA-A
-        //
-        // The new rule gives a different answer, and deliberately so — see
-        // `canonical_columns`. `test2` is `test` with two *pinned* columns exchanged,
-        // so the two fixtures are genuinely different alignments, not a legal
-        // permutation of one another, and they do not standardise to the same thing.
+        // `test2` is `test` with two *pinned* columns exchanged, so the two fixtures are
+        // genuinely different alignments rather than a legal permutation of one another,
+        // and they do not standardise to the same thing.
         //
         //   input          columns          canonical order [0, 3, 1, 2]
         //   1  A-A-        c0 = (A,A,A)     1  A--A
@@ -495,10 +449,9 @@ mod tests {
     }
 
     #[test]
-    fn dot_is_treated_as_a_gap_intentional_divergence() {
-        // The original hard-coded `-` as the only gap, so it would have seen `.` as a
-        // residue and pinned these two columns. The shared `is_gap` counts `.`, so the
-        // columns are free — `CODE_REVIEW.md` §3.
+    fn dot_is_treated_as_a_gap() {
+        // Were `-` the only gap character, `.` would read as a residue and these two
+        // columns would be pinned. The shared `is_gap` counts `.`, so they are free.
         //
         // Being free, they are then ordered by the canonical rule: row `a` holds its
         // residue in column 0, so column 0 leads and the input is already canonical.
@@ -582,9 +535,7 @@ mod tests {
     // ---------------------------------------------------------------------------
     // Property tests for confluence.
     //
-    // These are the reason the ordering rule was replaced in Stage 6, and they are
-    // the tests that would have caught the original. Randomised but deterministically
-    // seeded, so a failure is reproducible.
+    // Randomised but deterministically seeded, so a failure is reproducible.
     // ---------------------------------------------------------------------------
 
     /// xorshift64. A generator is needed here and pulling in `rand` for four tests is
@@ -647,11 +598,9 @@ mod tests {
 
     #[test]
     fn standardisation_is_confluent_over_legal_permutations() {
-        // *** THE HEADLINE PROPERTY. ***
-        //
-        // Two files holding the same alignment, differing only in where the gaps were
-        // placed, must standardise to byte-identical output. The original tool failed
-        // this on 78% of legal shuffles; this asserts it on every one.
+        // The property the whole pass exists for: two files holding the same alignment,
+        // differing only in where the gaps were placed, must standardise to
+        // byte-identical output.
         let mut rng = Rng::new(0xc0ffee);
         let mut shuffles_that_changed_the_layout = 0;
 
@@ -684,12 +633,12 @@ mod tests {
     }
 
     #[test]
-    fn the_original_tools_counterexample_now_converges() {
-        // Shrunk from the Stage 6 search. Columns 0 and 2 both hold a residue in row
-        // `s1`, so they are pinned; column 1 is free of both and so has three legal
-        // resting places. The original left it wherever the input put it, which is
-        // precisely the ambiguity that made the metric report 0.625 for an alignment
-        // against itself.
+    fn a_free_column_with_three_legal_places_converges() {
+        // The smallest shape that makes confluence non-trivial. Columns 0 and 2 both hold
+        // a residue in row `s1`, so they are pinned; column 1 is free of both and so has
+        // three legal resting places. An ordering rule that left it wherever the input
+        // put it would give these two files different layouts, and a nonzero distance
+        // between an alignment and itself.
         let a = msa(&[("s0", "A--"), ("s1", "A-A"), ("s2", "-A-")]);
         let b = msa(&[("s0", "A--"), ("s1", "AA-"), ("s2", "--A")]);
 

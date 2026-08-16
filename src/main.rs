@@ -1,40 +1,40 @@
 //! `rusty-metal` — pairwise symmetric-difference distances between multiple sequence
 //! alignments, with standardisation as the first stage of the pipeline.
 //!
+//! The metric is the one described in Blackburne, B. P. and Whelan, S. (2012), *Measuring
+//! the distance between multiple sequence alignments*, Bioinformatics 28(4), 495–502,
+//! <https://doi.org/10.1093/bioinformatics/btr701>. See [`distance`] for the definition
+//! this crate implements and [`homology`] for the structure it is computed over.
+//!
 //! # The two phases
 //!
-//! Stage 5 splits the run in two, and the split is load-bearing rather than tidy:
-//!
-//! - **Phase 1** reads and standardises every input file *once*, in parallel across
-//!   files, and emits the standardised alignments here if asked.
+//! - **Phase 1** reads and standardises every input file once, in parallel across files,
+//!   and emits the standardised alignments if asked.
 //! - **Phase 2** computes the pairwise distances over the alignments phase 1 left in
 //!   memory.
 //!
-//! Doing the standardisation inside the per-pair comparison instead would standardise
-//! each file once per pair it appears in (O(n) redundant work per file), and — worse —
-//! would have several rayon workers writing the *same* `--emit-standardised` path
-//! concurrently for any file appearing in more than one pair. Phase 1 has exactly one
-//! writer per output path, so that race cannot arise. It also removes the O(n²) re-reads
-//! the previous shape performed: `compare_alignment_pair` used to open both files afresh
-//! for every pair.
+//! Standardising inside the per-pair comparison instead would standardise each file once
+//! per pair it appears in, and would have several rayon workers writing the same
+//! `--emit-standardised` path concurrently for any file appearing in more than one pair.
+//! Phase 1 has exactly one writer per output path.
 //!
-//! Raw [`Msa`]s are roughly file-sized, so holding all N at once is affordable. The
-//! memory-hungry structures are the homology views, and those stay per-pair.
+//! An [`Msa`] is roughly the size of the file it came from, so holding all N at once is
+//! affordable; the larger per-pair structures are built and dropped inside phase 2.
 //!
 //! # Error handling policy
 //!
-//! The two phases fail differently, on purpose:
+//! The two phases fail differently:
 //!
 //! - A **phase 1** failure — a file that will not read, or one whose standardisation
-//!   residue-hash check fails — is a hard error that aborts the run. That file
-//!   participates in every pair it appears in, so continuing would produce a result set
-//!   silently missing an arbitrary subset of comparisons.
-//! - A **phase 2** failure — one pair that cannot be compared, e.g. two alignments over
-//!   different sequence sets — is logged and the run continues, with an empty distance
-//!   field in that pair's CSV row. This is the pre-existing behaviour and is preserved.
+//!   residue-hash check fails — aborts the run. That file participates in every pair it
+//!   appears in, so continuing would produce a result set silently missing an arbitrary
+//!   subset of comparisons.
+//! - A **phase 2** failure — one pair that cannot be compared, such as two alignments
+//!   over different sequence sets — is logged and the run continues, with an empty
+//!   distance field in that pair's CSV row.
 //!
-//! Note that a panic inside the rayon bridge aborts the whole process and bypasses the
-//! per-pair handler entirely, so this file avoids `unwrap`/`expect` outside its tests.
+//! A panic inside the rayon bridge aborts the whole process and bypasses the per-pair
+//! handler, so this file avoids `unwrap`/`expect` outside its tests.
 
 use crate::distance::compute_symmetric_difference;
 use crate::homology::{Registry, homology_view};
@@ -62,8 +62,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 ///
 /// The binary itself is `rusty-metal`, all lower case — that is what gets typed, what
 /// clap prints in its usage line, and what the Docker image is tagged with. This form
-/// is for prose: the startup banner and the help text. Keep the two distinct rather
-/// than making anything case-insensitive.
+/// appears in the startup banner and the help text.
 const DISPLAY_NAME: &str = "rusty-metAL";
 const STYLES: styling::Styles = styling::Styles::styled()
     .header(styling::AnsiColor::Green.on_default().bold())
@@ -112,11 +111,10 @@ pub struct Args {
     /// Skip the standardisation stage and compute distances on the alignments exactly as
     /// they appear on disk.
     ///
-    /// This is an escape hatch for isolating the effect of standardisation on a real
-    /// dataset. It is NOT a bug-compatibility switch and does not restore any pre-merge
-    /// behaviour: name-keyed sequence matching, the |A|+|B| denominator, the widened gap
-    /// definition (`.` counts as a gap) and the ragged/empty-input errors all apply
-    /// regardless of this flag.
+    /// This measures what standardisation contributes to a distance on a given dataset.
+    /// It disables the standardisation stage and nothing else: name-keyed sequence
+    /// matching, the |A|+|B| denominator, `.` counting as a gap, and the ragged and empty
+    /// input errors all apply either way.
     #[clap(long)]
     no_standardise: bool,
 }
@@ -357,12 +355,11 @@ fn check_stem_collisions(inputs: &[PathBuf]) -> Result<()> {
 /// Reads every input once, standardises it unless the plan says not to, and writes the
 /// result out if the plan asks for it.
 ///
-/// Runs in parallel across *files*, and the returned vector is in input order —
+/// Runs in parallel across files. The returned vector is in input order —
 /// `par_iter().map(...).collect::<Result<Vec<_>>>()` preserves indexing, which phase 2
 /// relies on to pair an alignment back up with its path.
 ///
-/// Any failure here aborts the run: see the module docs for why a bad file is not
-/// survivable the way a bad pair is.
+/// Any failure here aborts the run; see the module docs for the error handling policy.
 fn load_inputs(plan: &RunPlan) -> Result<Vec<Msa>> {
     if let Some(dir) = plan.emit_dir() {
         std::fs::create_dir_all(dir).with_context(|| {
@@ -418,8 +415,7 @@ fn load_inputs(plan: &RunPlan) -> Result<Vec<Msa>> {
 /// are keyed on, so the comparison does not depend on the order the records appear in
 /// either file.
 ///
-/// Neither reading nor standardisation happens here — both are phase 1's job, done once
-/// per file rather than once per pair.
+/// Reading and standardisation belong to phase 1, which does each once per file.
 fn compare_alignment_pair(msa_a: &Msa, msa_b: &Msa) -> Result<f64> {
     let registry = Registry::for_pair(msa_a, msa_b)?;
     let view_a = homology_view(msa_a, &registry)?;
@@ -435,11 +431,9 @@ struct DistanceResult {
 
 /// A short label for a path, for log lines only.
 ///
-/// The file stem when there is one, falling back to the whole path. Replaces
-/// `file_stem().unwrap().to_str().unwrap()` (`CODE_REVIEW.md` §1), which panicked on a
-/// stemless or non-UTF-8 path — on the *success* branch, destroying a run that had
-/// otherwise computed fine, and inside a rayon worker, so it took every other completed
-/// comparison down with it.
+/// The file stem when there is one, falling back to the whole path. A stemless or
+/// non-UTF-8 path must not fail here: this is called on the success branch inside a rayon
+/// worker, where a panic would take down every other completed comparison with it.
 fn label(path: &Path) -> String {
     match path.file_stem() {
         Some(stem) => stem.to_string_lossy().into_owned(),
@@ -500,9 +494,9 @@ fn compare_all_pairs(paths: &[PathBuf], msas: &[Msa]) -> Vec<DistanceResult> {
 /// carriage return or a line feed are wrapped in double quotes, and any embedded double
 /// quote is doubled. Everything else is emitted verbatim.
 ///
-/// Paths really do contain commas — `results/run,v2/aln.fasta` used to emit four fields
-/// where three were expected, and every downstream parser then misattributed the
-/// distance (`CODE_REVIEW.md` §5).
+/// Paths really do contain commas: unescaped, `results/run,v2/aln.fasta` emits four
+/// fields where three are expected, and a downstream parser then misattributes the
+/// distance.
 fn csv_escape(field: &str) -> String {
     if field.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", field.replace('"', "\"\""))
@@ -513,10 +507,8 @@ fn csv_escape(field: &str) -> String {
 
 /// Writes the CSV body to `writer`.
 ///
-/// Every write is `write_all` (a short `write` used to drop part of a row silently) and
-/// every error is returned rather than `expect`ed — `main` has always returned `Result`,
-/// so a panic here was throwing away an error path that already existed
-/// (`CODE_REVIEW.md` §3).
+/// Every write is `write_all`, since a short `write` would drop part of a row silently,
+/// and every error is returned for `main` to report.
 fn write_results<W: Write>(writer: &mut W, results: &[DistanceResult]) -> Result<()> {
     writer.write_all(b"msa_a,msa_b,distance\n")?;
     for result in results {
@@ -536,9 +528,9 @@ fn write_results<W: Write>(writer: &mut W, results: &[DistanceResult]) -> Result
 
 /// Writes the results to `path`, flushing explicitly.
 ///
-/// The explicit flush is the point: a `BufWriter` dropped at the end of `main` flushes
-/// implicitly and *discards the error*, so a failure on the final flush (disk full,
-/// quota) produced a truncated CSV with exit code 0 (`CODE_REVIEW.md` §3).
+/// A `BufWriter` dropped at the end of `main` flushes implicitly and discards the error,
+/// which would turn a failure on the final flush — disk full, quota exceeded — into a
+/// truncated CSV with exit code 0. Flushing here surfaces it.
 fn write_csv(path: &Path, results: &[DistanceResult]) -> Result<()> {
     let file = File::create(path)
         .with_context(|| format!("Failed to create the output file {}", path.display()))?;
@@ -560,19 +552,14 @@ fn write_csv(path: &Path, results: &[DistanceResult]) -> Result<()> {
 
 /// Runs a validated plan inside its own rayon thread pool.
 ///
-/// **A scoped pool, not `build_global`.** `rayon::ThreadPoolBuilder::build_global` may be
-/// called at most once per process and returns `Err` on every subsequent call, so the
-/// previous shape — building the global pool inside the pipeline function — meant the
-/// pipeline could only ever be run once, and any test that ran it twice failed on the
-/// second call for reasons that had nothing to do with what it was testing. Tolerating
-/// the already-initialised error would work but silently ignores `--num-threads` on all
-/// but the first run, and a `OnceLock` has the same problem. A pool built per run has
-/// neither issue: `install` makes it the pool that every nested `par_iter` and
-/// `par_bridge` in this crate uses, including the one inside
-/// `distance::compute_symmetric_difference`, and it is torn down when `run` returns.
+/// The pool is scoped to the call rather than global. `ThreadPoolBuilder::build_global`
+/// succeeds at most once per process, so a second run in the same process would either
+/// fail outright or have to ignore its `--num-threads`. `install` makes the scoped pool
+/// the one every nested `par_iter` and `par_bridge` in this crate uses, including the one
+/// inside [`compute_symmetric_difference`], and it is torn down when `run` returns.
 ///
-/// `num_threads(0)` means "let rayon decide from the available parallelism", which is
-/// the same default the `--num-threads 0` flag documents.
+/// `num_threads(0)` lets rayon decide from the available parallelism, which is what
+/// `--num-threads 0` documents.
 pub fn run(plan: &RunPlan) -> Result<()> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(plan.num_threads)
@@ -614,8 +601,8 @@ fn main() -> Result<()> {
         VERSION.bold().cyan()
     );
     if args.standardise_only && args.output_fp.is_some() {
-        // Not an error — the flag combination is coherent, just pointless — but silently
-        // ignoring an explicitly requested output path would be worse than saying so.
+        // The combination is coherent, so it is a warning rather than an error, but an
+        // explicitly requested output path should not be discarded in silence.
         log::warn!(
             "--standardise-only computes no distances, so -o/--output-fp is ignored and no CSV \
              will be written."
@@ -731,9 +718,8 @@ mod tests {
     fn plan_accepts_standardise_only_with_a_single_input_and_no_output() {
         // rusty-metal --standardise-only --emit-standardised out/ a.fa
         //
-        // Two things at once, both of which the pre-Stage-5 CLI made impossible: `-o` is
-        // not supplied (it used to be unconditionally required) and there is only one
-        // input (`num_args = 2..` used to reject it).
+        // Covers the two ways this mode differs from the distance modes at the parser
+        // level: `-o` is absent, and a single input is enough.
         let plan = parse(&["--standardise-only", "--emit-standardised", "out", "a.fa"])
             .expect("valid invocation");
         assert_eq!(
@@ -832,8 +818,8 @@ mod tests {
 
     #[test]
     fn plan_rejects_a_single_input_when_distances_are_computed() {
-        // The "at least 2" rule moved out of clap's `num_args` and into the plan, so it
-        // has to still fire in the mode that needs it.
+        // The "at least 2" rule lives in the plan rather than in clap's `num_args`, so
+        // this checks it still fires in the mode that needs it.
         let err = err_of(parse(&["-o", "dist.csv", "a.fa"]));
         assert!(err.contains("at least 2"), "got: {err}");
         assert!(
@@ -1015,7 +1001,7 @@ mod tests {
 
     #[test]
     fn a_legally_permuted_alignment_is_at_distance_zero() {
-        // *** THE POINT OF THE WHOLE MERGE, end to end. ***
+        // The property standardisation exists to provide, checked end to end.
         //
         // `test/test_legal_permutation.fasta` is `test/test.fasta` with column 3 moved
         // left past columns 2 and 1. Both moves are legal — no row holds a residue in
@@ -1027,12 +1013,9 @@ mod tests {
         //   >2 A--A         >2 AA--
         //   >3 AAA-         >3 A-AA
         //
-        // Standardised, they must be identical, so the distance must be exactly 0.
-        //
-        // Under the pre-Stage-6 ordering rule this was NOT 0 — that rule left a free
-        // column wherever the input file happened to put it, so the same alignment
-        // written two ways standardised to two different layouts. See
-        // `canonical_columns` for the full account.
+        // Standardised, they must be identical, so the distance must be exactly 0. This
+        // requires the ordering rule to place a free column somewhere determined by the
+        // alignment rather than by the input file; see `canonical_columns`.
         assert_eq!(
             distance_between_fixtures(&[], "test/test.fasta", "test/test_legal_permutation.fasta"),
             "0"
@@ -1044,8 +1027,8 @@ mod tests {
             "0"
         );
 
-        // And without standardisation it is emphatically not 0 — which is what makes
-        // this a test of standardisation rather than of the metric being trivial.
+        // Without standardisation the same pair is far from 0, so the assertions above
+        // test standardisation rather than a metric that returns 0 on everything.
         //
         // 10/28, worked by hand: the four column-0 slots and the shared residues in
         // slots (0,1), (2,1) and (2,2) agree, and every gap identity that moved with
@@ -1062,10 +1045,10 @@ mod tests {
     }
 
     #[test]
-    fn end_to_end_without_standardisation_reproduces_the_baseline() {
-        // The pre-merge number, and the one Stages 1-4 preserved. `--no-standardise`
-        // skips only the standardise stage, so this is the value that pins "nothing
-        // except standardisation moved".
+    fn end_to_end_without_standardisation_pins_the_fixture_distance() {
+        // 6/28 on the 3x4 fixtures, hand-verified in
+        // `distance::tests::the_fixture_pair_distance_is_hand_verified`. `--no-standardise`
+        // skips the standardise stage and nothing else, so this pins the metric itself.
         assert_eq!(
             distance_from_a_real_run(&["--no-standardise"]),
             "0.21428571428571427"
@@ -1073,11 +1056,9 @@ mod tests {
     }
 
     #[test]
-    fn end_to_end_with_standardisation_pins_the_new_fixture_distance() {
-        // *** This number is a RESULT of wiring standardisation in, not a target. ***
-        //
-        // Reworked by hand in Stage 6, when the canonical ordering rule changed. Both
-        // sides now move; under the old rule `test.fasta` was a fixed point.
+    fn end_to_end_with_standardisation_pins_the_fixture_distance() {
+        // The distance between the two fixtures with standardisation on. Both fixtures
+        // move under the canonical ordering rule, so neither side is a fixed point.
         //
         //   test/test.fasta   standardised   test/test2.fasta   standardised
         //   >1 AA--           >1 AA--        >1 A-A-            >1 A--A
@@ -1100,24 +1081,18 @@ mod tests {
         //   --------+--------------------+--------------------+-------+--------
         //                                                sum:   14       28
         //
-        // 14 / 28 = 0.5, against 6/28 = 0.21428571428571427 unstandardised. The value
-        // is unchanged from Stage 5 by coincidence, not by construction — the table
-        // that produces it is entirely different. Every column-0 slot agrees (column 0
-        // is all residues in both files and cannot move), and every slot that involves
-        // a gap identity disagrees.
+        // 14/28 = 0.5, against 6/28 = 0.21428571428571427 unstandardised. Every column-0
+        // slot agrees — column 0 is all residues in both files and cannot move — and
+        // every slot involving a gap identity disagrees.
         //
-        // The distance went *up* relative to not standardising, which is worth being
-        // explicit about because the merge is motivated as "strips gap-placement
-        // artefacts out of the metric". It does strip them — but stripping is not
-        // shrinking. Standardisation moves each alignment to its *own* canonical layout;
-        // it does not move two different alignments toward each other.
-        //
-        // These two fixtures are genuinely different alignments: `test2` is `test` with
-        // two *pinned* columns exchanged, which is not a legal permutation, so nothing
-        // requires them to converge. The case standardisation is for — a pair differing
-        // only by a legal permutation — now provably goes to 0, which is what
-        // `standardise::tests::standardisation_is_confluent_over_legal_permutations`
-        // asserts and what the old rule failed to do.
+        // The distance is higher here than without standardisation. Standardisation
+        // moves each alignment to its own canonical layout; it does not move two
+        // different alignments toward each other, so a pair of genuinely different
+        // alignments can move either way. These two are genuinely different: `test2` is
+        // `test` with two *pinned* columns exchanged, which is not a legal permutation,
+        // so nothing requires them to converge. The case that does converge is covered by
+        // `a_legally_permuted_alignment_is_at_distance_zero` and by
+        // `standardise::tests::standardisation_is_confluent_over_legal_permutations`.
         assert_eq!(distance_from_a_real_run(&[]), "0.5");
     }
 
@@ -1156,10 +1131,11 @@ mod tests {
             .count();
         assert_eq!(count, 2, "one output per input");
 
-        // Both fixtures move under the Stage 6 canonical rule; the CRLF and missing
-        // final newline of the fixtures are normalised on write. These two values are
-        // derived in `standardise::tests::the_test_fixture_standardises_to_its_canonical_form`
-        // and `..._the_test2_fixture_...`, which show the column working.
+        // Both fixtures move under the canonical rule, and the CRLF and missing final
+        // newline of the fixtures are normalised on write. The column working behind
+        // these two values is in
+        // `standardise::tests::the_test_fixture_standardises_to_its_canonical_form` and
+        // `..._the_test2_fixture_...`.
         assert_eq!(read_to_string(&emitted_a), ">1\nAA--\n>2\nA-A-\n>3\nAA-A\n");
         assert_eq!(read_to_string(&emitted_b), ">1\nA--A\n>2\nAA--\n>3\nA-AA\n");
 
@@ -1279,19 +1255,18 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------
-    // The rayon global-pool trap
+    // The rayon thread pool
     // -----------------------------------------------------------------------------
 
     #[test]
     fn the_pipeline_can_be_run_twice_in_one_process() {
-        // `rayon::ThreadPoolBuilder::build_global` can only succeed once per process,
-        // and the previous `process()` called it on every invocation — so a second run
-        // in the same process failed with "The global thread pool has already been
-        // initialized". `run` builds a scoped pool instead, so this passes.
+        // `rayon::ThreadPoolBuilder::build_global` can only succeed once per process, so
+        // a run that built the global pool would fail the second time with "The global
+        // thread pool has already been initialized". `run` builds a scoped pool.
         //
-        // Both runs also ask for a specific thread count, which is the part a
-        // tolerate-the-error or `OnceLock` approach would silently drop on the second
-        // call.
+        // The two runs ask for different thread counts, so an implementation that
+        // initialised the pool once and reused it would be caught here rather than
+        // passing while silently ignoring `-n`.
         let dir = temp_dir("twice");
 
         for (n, threads) in [(0usize, "2"), (1usize, "3")] {
