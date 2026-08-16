@@ -12,6 +12,12 @@ description = "rusty-metAL: pairwise distances between multiple sequence alignme
 readme = "README.md"
 repository = "https://github.com/dlejeune/rusty-metal"
 
+[package.metadata.wix]
+upgrade-guid = "BBEA1C8F-A82E-4831-87F9-DBC4C6D6A138"
+path-guid = "D39F1CC4-7BA4-419D-8621-07CE602A8B4B"
+license = false
+eula = false
+
 [dependencies]
 anyhow = "1.0.97"
 clap = { version = "4.5.31", features = ["derive"] }
@@ -22,3 +28,8 @@ colored = "3.0.0"
 simple_logger = "5.0.0"
 itertools = "0.14.0"
 rayon = "1.11.0"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
