@@ -6,6 +6,47 @@ running it against constructed inputs.
 
 Findings are grouped by what they cost you, not by file.
 
+## Status: all 12 findings discharged as of `b33b7c2`
+
+Re-verified at `b33b7c2` by running the release binary against the inputs each finding
+names, not only by reading the code. `just check` (fmt, `clippy -D warnings`, 93 tests)
+is clean.
+
+**The file and line references in the body below are pre-merge and mostly dangle.**
+`src/utils.rs` and `src/datastructures.rs` no longer exist; the tree is now `msa.rs`,
+`homology.rs`, `standardise.rs`, `distance.rs`, `main.rs`. Where each finding ended up:
+
+| § | Finding | Fixed in |
+|---|---------|----------|
+| 0 | Sequences matched by file position | `homology.rs:98` `Registry::for_pair` — names read at `msa.rs:241`, ids assigned per pair |
+| 0 | Distance not symmetric | `distance.rs:76` — bounds come from the registry, denominator is `\|A\| + \|B\|` |
+| 0 | Per-column `log::warn!` spam | Gone: a mismatched sequence set is one `Err` from `Registry::for_pair`, reported once per pair |
+| 1 | Ragged FASTA panic | `msa.rs:52` `Msa::new` returns `Err` naming the record and both lengths |
+| 1 | Empty FASTA underflow | `msa.rs:253` — `read_msa` reports "contains no records" |
+| 1 | Non-UTF-8 path `unwrap` | `main.rs:443` `label()` — `to_string_lossy`, falling back to the whole path |
+| 2 | Cloned `HashSet` per residue | `homology.rs:205` `HomologyView` — one set per column, indexed, O(num_seqs × width) |
+| 3 | `.` not treated as a gap | `msa.rs:221` `is_gap` — the crate's single gap definition, `-` and `.` |
+| 3 | Output silently truncated | `main.rs:542` `write_csv` — explicit flush, `write_all`, errors returned not `expect`ed |
+| 4 | `Iterator for Sequence` never advances | Removed with `datastructures.rs` |
+| 4 | `compute_jaccard_distance` panics | Removed (was dead code) |
+| 5 | CSV fields unquoted | `main.rs:506` `csv_escape` — RFC 4180 |
+| 5 | `Display for Base` prints quotes | Removed with `datastructures.rs` |
+| — | 8 build warnings | Zero warnings; `clippy -D warnings` is enforced by `just check` |
+
+Behavioural checks run at `b33b7c2`, each the scenario the finding describes:
+
+```
+empty.fasta            → Error: MSA file test/empty.fasta contains no records   (was: subtract overflow)
+ragged.fasta           → Error: record '3' has length 3, first record has 4     (was: index out of bounds)
+test vs test_reordered → 0                                                      (was: 0.571)
+3-seq vs 2-seq         → error both ways, empty distance field, run continues   (was: 0.25 / 0.5)
+`.` gaps vs `-` gaps   → 0                                                      (was: silently wrong)
+path containing a comma→ "…/run,v2/aln.fasta",test/test2.fasta,0.5              (was: four fields)
+d(a,b) vs d(b,a)       → 0.5 / 0.5
+```
+
+The rest of this document is the review as originally written, kept for the reasoning.
+
 ---
 
 ## 0. Deferred — handled by the incoming merge
