@@ -1,4 +1,12 @@
-# rusty-metAL
+```
+ ▄▄▄▄▄▄   ▄▄   ▄▄ ▄▄▄▄▄▄▄ ▄▄▄▄▄▄▄ ▄▄   ▄▄    ▄▄   ▄▄ ▄▄▄▄▄▄▄ ▄▄▄▄▄▄▄ ▄▄▄▄▄▄▄ ▄▄▄
+█   ▄  █ █  █ █  █       █       █  █ █  █  █  █▄█  █       █       █       █   █
+█  █ █ █ █  █ █  █  ▄▄▄▄▄█▄     ▄█  █▄█  █  █       █    ▄▄▄█▄     ▄█   ▄   █   █
+█   █▄▄█▄█  █▄█  █ █▄▄▄▄▄  █   █ █       █  █       █   █▄▄▄  █   █ █  █▄█  █   █
+█    ▄▄  █       █▄▄▄▄▄  █ █   █ █▄     ▄█  █       █    ▄▄▄█ █   █ █       █   █▄▄▄
+█   █  █ █       █▄▄▄▄▄█ █ █   █   █   █    █ ██▄██ █   █▄▄▄  █   █ █   ▄   █       █
+█▄▄▄█  █▄█▄▄▄▄▄▄▄█▄▄▄▄▄▄▄█ █▄▄▄█   █▄▄▄█    █▄█   █▄█▄▄▄▄▄▄▄█ █▄▄▄█ █▄▄█ █▄▄█▄▄▄▄▄▄▄█
+```
 
 Pairwise distances between multiple sequence alignments, based on how much the
 alignments disagree about which residues are homologous to which.
@@ -6,7 +14,7 @@ alignments disagree about which residues are homologous to which.
 The metric is the one described in
 
 > Blackburne, B. P. and Whelan, S. (2012). Measuring the distance between multiple
-> sequence alignments. *Bioinformatics* **28**(4), 495–502.
+> sequence alignments. _Bioinformatics_ **28**(4), 495–502.
 > <https://doi.org/10.1093/bioinformatics/btr701>
 
 and the name follows the authors' own `metAL`. The crate and the binary are
@@ -40,7 +48,7 @@ Both `-` and `.` count as gaps.
 
 ## Standardisation
 
-Gap *placement* is largely an artefact of whichever aligner produced the file: the same
+Gap _placement_ is largely an artefact of whichever aligner produced the file: the same
 alignment can be written with its columns in many different orders, and those orders
 change the gap identities and therefore the distance. Standardisation rewrites each
 alignment into a canonical column layout so that this artefact does not reach the metric.
@@ -55,10 +63,9 @@ Standardisation:
    pinning constraints allow.
 
 The result is a canonical form: **two files holding the same alignment, differing only in
-where the gaps sit, standardise to byte-identical output and therefore compare at distance
-0.** Residue content is unchanged, which is verified against a residue hash on every run.
+where the gaps sit, standardise to byte-identical output and therefore compare at distance 0.** Residue content is unchanged, which is verified against a residue hash on every run.
 
-Note that standardisation moves each alignment to *its own* canonical layout. It does not
+Note that standardisation moves each alignment to _its own_ canonical layout. It does not
 move two genuinely different alignments toward each other, so a distance between two
 different alignments can go either up or down relative to not standardising.
 
@@ -94,13 +101,13 @@ rusty-metal -o dist.csv --no-standardise a.fasta b.fasta
 
 ### Options
 
-| Option | Meaning |
-| --- | --- |
-| `-o`, `--output-fp <FILE>` | Where to write the distance CSV. Required unless `--standardise-only`. |
-| `-n`, `--num-threads <N>` | Worker threads. `0` (the default) lets rayon choose. |
+| Option                      | Meaning                                                                                    |
+| --------------------------- | ------------------------------------------------------------------------------------------ |
+| `-o`, `--output-fp <FILE>`  | Where to write the distance CSV. Required unless `--standardise-only`.                     |
+| `-n`, `--num-threads <N>`   | Worker threads. `0` (the default) lets rayon choose.                                       |
 | `--emit-standardised <DIR>` | Write each standardised alignment to `<DIR>/<stem>.standardised.fasta`. Created if absent. |
-| `--standardise-only` | Standardise and stop. Requires `--emit-standardised`. |
-| `--no-standardise` | Skip standardisation and compare the files as they are. |
+| `--standardise-only`        | Standardise and stop. Requires `--emit-standardised`.                                      |
+| `--no-standardise`          | Skip standardisation and compare the files as they are.                                    |
 
 Illegal combinations (`--standardise-only` without `--emit-standardised`,
 `--emit-standardised` with `--no-standardise`, and so on) are rejected before any file is
@@ -135,12 +142,12 @@ in it, is logged and the run continues.
 Every pair is compared independently, so a run parallelises across pairs (`-n`). Measured
 on a release build:
 
-| Workload | Time | Peak memory |
-| --- | --- | --- |
-| 1 pair, 500 sequences × 5000 columns | 0.7 s | 49 MB |
-| 1 pair, 60 × 2000 at 97% gaps | 0.16 s | — |
-| 6 pairs, 300 × 3000, `-n 1` | — | 22 MB |
-| 6 pairs, 300 × 3000, `-n 6` | — | 92 MB |
+| Workload                             | Time   | Peak memory |
+| ------------------------------------ | ------ | ----------- |
+| 1 pair, 500 sequences × 5000 columns | 0.7 s  | 49 MB       |
+| 1 pair, 60 × 2000 at 97% gaps        | 0.16 s | —           |
+| 6 pairs, 300 × 3000, `-n 1`          | —      | 22 MB       |
+| 6 pairs, 300 × 3000, `-n 6`          | —      | 92 MB       |
 
 Peak memory scales with the largest pair in flight times the thread count. Standardisation
 adds nothing measurable at these sizes: the 500 × 5000 pair peaks at the same 49 MB with
@@ -192,3 +199,7 @@ with standardisation differ from those of `0.1.x`. The column ordering rule diff
 the one `standardise-msa` used, which did not produce a canonical form: an alignment
 written two different ways could standardise to two different layouts, so a pair of files
 holding the same alignment did not reliably compare at distance 0.
+
+## License
+
+This work is licensed under the MIT public license and can be found [here](LICENSE)
