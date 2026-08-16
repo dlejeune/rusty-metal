@@ -6,7 +6,11 @@
 name = "rusty-metal"
 version = "0.2.0"
 edition = "2024"
-description = "rusty-metAL: pairwise distances between multiple sequence alignments, measured over homology sets"
+authors = ["Daniel Le Jeune"]
+license-file = "LICENSE"
+description = "rusty-metAL: pairwise distances between multiple sequence alignments"
+readme = "README.md"
+repository = "https://github.com/dlejeune/rusty-metal"
 
 [dependencies]
 anyhow = "1.0.97"
