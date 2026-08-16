@@ -3,11 +3,18 @@
 Pairwise distances between multiple sequence alignments, based on how much the
 alignments disagree about which residues are homologous to which.
 
-The crate and the binary are `rusty-metal`, all lower case; `rusty-metAL` is the
-stylised form used in prose and help output.
+The metric is the one described in
 
-As of `0.2.0` this also subsumes the standalone `standardise-msa` tool: column
-standardisation is now the first stage of the pipeline rather than a separate program.
+> Blackburne, B. P. and Whelan, S. (2012). Measuring the distance between multiple
+> sequence alignments. *Bioinformatics* **28**(4), 495–502.
+> <https://doi.org/10.1093/bioinformatics/btr701>
+
+and the name follows the authors' own `metAL`. The crate and the binary are
+`rusty-metal`, all lower case; `rusty-metAL` is the stylised form used in prose and help
+output.
+
+Column standardisation runs as the first stage of the pipeline, so the standalone
+`standardise-msa` tool is no longer needed; `--standardise-only` does what it did.
 
 ## What it computes
 
@@ -47,10 +54,9 @@ Standardisation:
 3. orders the rest so that residues fill the higher rows as far to the left as the
    pinning constraints allow.
 
-The result is a genuine canonical form: **two files holding the same alignment, differing
-only in where the gaps sit, standardise to byte-identical output and therefore compare at
-distance 0.** Standardisation never changes residue content, and the result is verified
-against a residue hash on every run.
+The result is a canonical form: **two files holding the same alignment, differing only in
+where the gaps sit, standardise to byte-identical output and therefore compare at distance
+0.** Residue content is unchanged, which is verified against a residue hash on every run.
 
 Note that standardisation moves each alignment to *its own* canonical layout. It does not
 move two genuinely different alignments toward each other, so a distance between two
@@ -74,7 +80,7 @@ Distances, and keep the standardised alignments too:
 rusty-metal -o dist.csv --emit-standardised out/ a.fasta b.fasta
 ```
 
-Standardise only, no distances — this is the replacement for `standardise-msa`:
+Standardise only, without computing distances:
 
 ```
 rusty-metal --standardise-only --emit-standardised out/ a.fasta
@@ -100,10 +106,10 @@ Illegal combinations (`--standardise-only` without `--emit-standardised`,
 `--emit-standardised` with `--no-standardise`, and so on) are rejected before any file is
 opened, as are two inputs whose filenames would produce the same output file.
 
-`--no-standardise` is an escape hatch for isolating the effect of standardisation on a
-real dataset. It is **not** a bug-compatibility switch: name-keyed matching, the
-`|A|+|B|` denominator, `.` as a gap, and the ragged/empty-input errors all apply
-regardless.
+`--no-standardise` disables the standardisation stage and nothing else, so it measures
+what standardisation contributes to a distance on a given dataset. Every other rule
+described here — name-keyed matching, `.` as a gap, the ragged and empty input errors —
+applies either way.
 
 ### Output
 
@@ -126,34 +132,23 @@ in it, is logged and the run continues.
 
 ## Performance
 
-Every pair is compared independently, so the run parallelises across pairs (`-n`). Peak
-memory, release build:
+Every pair is compared independently, so a run parallelises across pairs (`-n`). Measured
+on a release build:
 
 | Workload | Time | Peak memory |
 | --- | --- | --- |
 | 1 pair, 500 sequences × 5000 columns | 0.7 s | 49 MB |
-| 6 pairs, 300 × 3000, `-n 1` | | 22 MB |
-| 6 pairs, 300 × 3000, `-n 6` | | 92 MB |
-| 1 pair, 60 × 2000 at 97% gaps | 0.16 s | |
+| 1 pair, 60 × 2000 at 97% gaps | 0.16 s | — |
+| 6 pairs, 300 × 3000, `-n 1` | — | 22 MB |
+| 6 pairs, 300 × 3000, `-n 6` | — | 92 MB |
 
-The homology view of an alignment is about 4× the size of the FASTA that produced it, and
-two views exist per comparison in flight — so the memory a run needs is set by the largest
-pair times the thread count, not by the total input size. Standardisation is not a
-significant cost at these sizes: the 500 × 5000 pair takes the same 49 MB with it on as
-with `--no-standardise`.
+Peak memory scales with the largest pair in flight times the thread count. Standardisation
+adds nothing measurable at these sizes: the 500 × 5000 pair peaks at the same 49 MB with
+it on as under `--no-standardise`.
 
-Two things do scale in ways worth knowing about:
-
-- **Every input alignment is held in memory for the whole run.** Files are read and
-  standardised once, up front, rather than re-read for each pair they appear in. That is
-  a large win in time — N reads rather than N-1 per file — but it means a run over a
-  thousand 500 × 5000 alignments holds roughly 2.5 GB before the first comparison starts.
-- **Choosing the canonical column order costs O(width² × num_seqs).** In practice it
-  disappears at both extremes: dense alignments pin almost every column pair and the scan
-  short-circuits immediately, while sparse ones lose most of their columns to the all-gap
-  drop before the quadratic work begins. The shape that would bite is many columns, few
-  sequences, and a gap density high enough that columns are mutually free but low enough
-  that they are not all-gap.
+Each input is read and standardised once, up front, and held for the rest of the run. A
+run over a thousand 500 × 5000 alignments therefore holds roughly 2.5 GB before the first
+comparison starts.
 
 ## Development
 
@@ -166,14 +161,13 @@ just check      # fmt, clippy, docs and tests — what CI runs
 just run -- -o dist.csv test/test.fasta test/test2.fasta
 ```
 
-The internals are documented in some depth — each module opens with a header explaining
-what it does and why the shape it has was chosen over the alternatives. CI publishes that
-to **<https://dlejeune.github.io/rusty-metal/>** on every push to `main`, or run
-`just doc-open` for the same thing locally.
+Each module opens with a header describing what it holds. CI publishes the rustdoc to
+**<https://dlejeune.github.io/rusty-metal/>** on every push to `main`; `just doc-open`
+builds the same pages locally.
 
-`just check` is the gate. It includes `cargo doc` because a doc comment can rot in ways
-nothing else catches: a link to an item that was later renamed still compiles and still
-passes the tests.
+`just check` is the gate CI runs. It includes `cargo doc` because a doc comment can rot in
+ways nothing else catches: a link to an item that was later renamed still compiles and
+still passes the tests.
 
 ### Docker
 
@@ -191,21 +185,10 @@ docker run --rm -v ./:/data dlejeune/rusty-metal:0.2.0 \
     rusty-metal -o /data/dist.csv /data/a.fasta /data/b.fasta
 ```
 
-## Repository map
-
-Alongside the source, three documents record how the tree got here. They are historical
-records, not user documentation, and only this README describes current behaviour:
-
-| File | What it is |
-| --- | --- |
-| `INTEGRATION_PLAN.md` | The plan for folding `standardise-msa` in, written before the work. Stage numbering throughout the other two refers to it. |
-| `INTEGRATION_NOTES.md` | The running log of that work, one entry per stage, recording what was decided and what turned out to be wrong. Stages 6 and 8 are the substantial ones. |
-| `CODE_REVIEW.md` | A review of the pre-merge tree at `6f73a81`. All 12 findings are discharged; the status header at the top maps each to where it was fixed. The body below it is the original review, and its file and line references are pre-merge and mostly dangle. |
-
 ## Compatibility
 
-`0.2.0` is **not** output-compatible with `standardise-msa`, and distances computed with
-standardisation differ from earlier builds of this crate. The ordering rule was replaced
-because the original was not confluent — the same alignment written two different ways
-standardised to two different layouts, which defeated the purpose of standardising at
-all. `INTEGRATION_NOTES.md` (Stage 6) records the investigation and the numbers.
+Standardised output is not byte-compatible with `standardise-msa`, and distances computed
+with standardisation differ from those of `0.1.x`. The column ordering rule differs from
+the one `standardise-msa` used, which did not produce a canonical form: an alignment
+written two different ways could standardise to two different layouts, so a pair of files
+holding the same alignment did not reliably compare at distance 0.

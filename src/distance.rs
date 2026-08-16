@@ -9,57 +9,45 @@
 //! ```
 //!
 //! where `A(r)` is the set of elements sharing `r`'s column in alignment `a`, and `B(r)`
-//! the same in `b`. Both sums range over the residues that exist in *both* views — a
-//! `None` slot means "this sequence has no residue at that position", i.e. past the end
-//! of its residues, and contributes nothing to either sum.
+//! the same in `b`. Both sums range over the residues that exist in both views: a `None`
+//! slot means the sequence has no residue at that position, i.e. it is past the end of
+//! that sequence's residues, and contributes to neither sum.
 //!
-//! # What changed in Stage 4
+//! The metric is defined in Blackburne, B. P. and Whelan, S. (2012), *Measuring the
+//! distance between multiple sequence alignments*, Bioinformatics 28(4), 495–502,
+//! <https://doi.org/10.1093/bioinformatics/btr701>.
 //!
-//! Two things, both from `CODE_REVIEW.md` §0:
+//! # The two bounds
 //!
-//! - **The iteration bound is `registry.len()`**, not the first alignment's sequence
-//!   count. `main.rs` used to pass `msa_a.num_seqs`, so a comparison against an
-//!   alignment with more sequences was silently computed over a truncated overlap and
-//!   `d(a, b) != d(b, a)`. [`Registry::for_pair`] now rejects mismatched name sets
-//!   outright, so the sequence dimension is shared by construction.
-//! - **The denominator is `|A| + |B|`**, not `2·|A|`. Taking both counts from the A side
-//!   made the ratio depend on which alignment was passed first whenever the two sides'
-//!   set sizes could differ.
+//! The iteration runs over `registry.len()` rather than either alignment's own sequence
+//! count, and the denominator is `|A| + |B|` rather than `2·|A|`. Both keep the result
+//! independent of which alignment is passed first: [`Registry::for_pair`] has already
+//! rejected any pair whose name sets differ, so `d(a, b) == d(b, a)` by construction.
 //!
-//! Worth writing down, because it is not obvious and it is the kind of thing that looks
-//! like a bug later: on any pair that gets this far, **the two denominators are equal**.
-//! A residue's homology set is its whole column minus itself, and every element in a
-//! column carries a distinct `seq`, so no two collapse in the hash set and
-//! `|A(r)| = |B(r)| = num_seqs - 1` for *every* residue. The registry has already
-//! forced both alignments to the same sequence count. So the fix is numerically inert
-//! today. `|A| + |B|` is the definition of the metric; `2·|A|` merely happened to agree
-//! with it, and would stop agreeing under any move to residues-only or gap-filtered
-//! sets. `every_homology_set_has_size_num_seqs_minus_one` pins the invariant.
+//! On any pair that reaches this point the two denominators are in fact equal. A
+//! residue's homology set is its whole column minus itself, every element in a column
+//! carries a distinct sequence, and the registry has forced both alignments to the same
+//! sequence count, so `|A(r)| = |B(r)| = num_seqs - 1` for every residue.
+//! `every_homology_set_has_size_num_seqs_minus_one` pins that. `|A| + |B|` is what the
+//! metric is defined as, and it is what continues to hold if the sets ever become
+//! residues-only or gap-filtered.
 //!
-//! # What changed in the `CODE_REVIEW.md` §2 fix
+//! # Working from columns rather than homology sets
 //!
-//! The sets this reads are now **columns**, shared by every residue in them, rather
-//! than one materialised homology set per residue. That took live memory from
-//! O(num_seqs² × width) per alignment to O(num_seqs × width). See [`HomologyView`].
+//! [`HomologyView`] stores one column per alignment column, shared by every residue in
+//! it, rather than a homology set per residue. A column includes the residue itself,
+//! while the homology set is the column minus that one element
+//! `x = {sequence, position, gap: false}`. The two agree where it matters:
 //!
-//! # And what changed after it
+//! - **The numerator is unaffected.** A residue's identity does not depend on the gaps
+//!   around it, so `x` is the same value in both alignments. It is therefore in both
+//!   columns and in neither symmetric difference:
+//!   `(Ca \ {x}) Δ (Cb \ {x}) == Ca Δ Cb`.
+//! - **The denominator subtracts one per side**, giving `|A| = |Ca| - 1`.
 //!
-//! The columns are no longer `HashSet`s at all, but runs of `u32` codes, and
-//! `|A Δ B|` is counted by scanning two of them in step — see
-//! [`symmetric_difference_size`] for why that is the same number. The per-slot
-//! contributions are also reduced in place instead of being collected into a `Vec` and
-//! folded afterwards. Neither changes a result: on a 500 x 5000 measurement pair the
-//! distance is identical to the last digit, while peak RSS goes from 330 MB to 49 MB and
-//! the run from 3.5 s to 0.7 s.
-//!
-//! It is exact, not an approximation. A column includes the residue itself, and the
-//! homology set is the column minus that one element `x = {sequence, position, gap:
-//! false}`. Because a residue's identity does not depend on the gaps around it, `x` is
-//! the same value in both alignments, so it is in both columns and therefore in neither
-//! symmetric difference: `(Ca \ {x}) Δ (Cb \ {x}) == Ca Δ Cb`. The numerator needs no
-//! adjustment at all; only the denominator subtracts the one element per side.
-//! `sharing_the_column_sets_computes_exactly_the_materialised_distance` checks this
-//! against a literal implementation over every 2x3 and 3x2 alignment.
+//! `sharing_the_column_sets_computes_exactly_the_materialised_distance` checks the
+//! identity against an implementation that materialises every homology set, over every
+//! 2×3 and 3×2 alignment.
 
 use crate::homology::{HomologyView, Registry};
 use anyhow::{Result, bail};
@@ -112,10 +100,9 @@ impl ResidueContribution {
 ///           = 2·#{s : a[s] ≠ b[s]}
 /// ```
 ///
-/// With `s` fixed on both sides the `seq` component is common, which is exactly why the
-/// stored codes can omit it (see `homology::residue_code`). So the whole set machinery
-/// collapses to counting disagreements down two slices — no hashing, no allocation, and
-/// no `HashSet` to have built in the first place.
+/// With `s` fixed on both sides the `seq` component is common, which is also why the
+/// stored codes can omit it (see `homology::residue_code`). The set operation therefore
+/// reduces to counting disagreements down two slices.
 ///
 /// `sharing_the_column_sets_computes_exactly_the_materialised_distance` checks this
 /// against literal `HashSet` symmetric differences over every 2x3 and 3x2 alignment.
@@ -135,10 +122,10 @@ fn symmetric_difference_size(column_a: &[u32], column_b: &[u32]) -> usize {
 /// The symmetric-difference distance between two homology views built against
 /// `registry`.
 ///
-/// Returns `Err` if the two views have no residues in common to compare — a pair of
-/// single-sequence alignments (where every homology set is empty), or alignments made
-/// entirely of gaps. The ratio is `0/0` there; the old code returned `NaN`, which would
-/// be written into the CSV as a confident-looking result.
+/// Returns `Err` if the two views have no residues in common to compare: a pair of
+/// single-sequence alignments, where every homology set is empty, or alignments made
+/// entirely of gaps. The ratio is `0/0` there, and an `Err` keeps a `NaN` out of the CSV
+/// where it would be indistinguishable from a real result.
 pub fn compute_symmetric_difference(
     view_a: &HomologyView,
     view_b: &HomologyView,
@@ -156,18 +143,15 @@ pub fn compute_symmetric_difference(
     // of the two sequences has no residue at this position. That is the ordinary case
     // for every position past a sequence's residue count, not an error.
     //
-    // Reduced as it goes rather than collected first. The previous shape built a
-    // `Vec<Option<ResidueContribution>>` of one 24-byte entry per (sequence, position)
-    // slot — 60 MB on a 500 x 5000 pair — and then immediately folded it to two numbers.
+    // Reduced as it goes rather than collected first, so no per-slot vector is
+    // materialised only to be folded to two numbers.
     let totals = (0..registry.len())
         .cartesian_product(0..width)
         .par_bridge()
         .map(|(sequence, position)| {
-            // Note there is no fallback arm reporting a missing sequence here. The old
-            // code logged a warning in that position claiming the sequence was absent
-            // from the hash set; it could not fire for the stated reason (the index was
-            // bounded by A's own length), it fired once per column when it did fire, and
-            // `Registry::for_pair` now makes a genuinely missing sequence impossible.
+            // A missing sequence needs no arm of its own: `Registry::for_pair` has
+            // already rejected any pair that does not share a name set, and both views
+            // are sized by the registry.
             //
             // These are the residue's *column*, which includes the residue itself; the
             // homology set proper is the column minus that one element. The two are
@@ -242,15 +226,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------
-    // The property the denominator fix exists for
+    // Symmetry
     // -----------------------------------------------------------------------------
 
     #[test]
     fn the_distance_is_symmetric_on_the_fixture_pair() {
-        // `d(a, b) == d(b, a)` — exactly, as `f64` bits, not to within a tolerance.
-        // Before Stage 4 this could not be relied on: the iteration ran over A's
-        // sequence count and the denominator counted A's sets twice, so swapping the
-        // arguments swapped which alignment defined both bounds (`CODE_REVIEW.md` §0).
+        // `d(a, b) == d(b, a)` exactly, as `f64` bits, rather than to within a
+        // tolerance. Symmetry requires both the iteration bound and the denominator to
+        // come from the shared registry rather than from whichever alignment is first.
         let forwards = distance_from_files("test/test.fasta", "test/test2.fasta")
             .expect("fixtures should compare");
         let backwards = distance_from_files("test/test2.fasta", "test/test.fasta")
@@ -325,11 +308,9 @@ mod tests {
         //
         // 6 / 28 = 3/14 = 0.21428571428571427.
         //
-        // This is the *same* number the pre-merge binary emitted under the old `2·|A|`
-        // denominator, and that is not a coincidence: |A| = |B| = num_seqs - 1 = 2 in
-        // every row of the table, so 2·|A| and |A| + |B| agree term for term. Numerator
-        // 6 and denominator 28 are unchanged. See the module docs for why that holds in
-        // general, and for the change that would break it.
+        // |A| = |B| = num_seqs - 1 = 2 in every row of the table, so `2·|A|` and
+        // `|A| + |B|` agree term for term here. See the module docs for why that holds
+        // in general, and for the change that would break it.
         let distance = distance_from_files("test/test.fasta", "test/test2.fasta")
             .expect("fixtures should compare");
         assert_eq!(distance, 0.21428571428571427);
@@ -344,14 +325,14 @@ mod tests {
     #[test]
     fn reordered_records_give_exactly_zero() {
         // `test/test_reordered.fasta` is `test/test.fasta` with the records written
-        // 2, 1, 3. Same alignment, so distance 0. The old positional keying reported
-        // 0.5714285714285714 here (`CODE_REVIEW.md` §0).
+        // 2, 1, 3. It is the same alignment, so the distance is 0: sequences are keyed
+        // by name, so the order the records appear in the file cannot matter.
         assert_eq!(
             distance_from_files("test/test.fasta", "test/test_reordered.fasta")
                 .expect("fixtures should compare"),
             0.0
         );
-        // And in the other direction, since that is the whole point of this stage.
+        // And in the other direction.
         assert_eq!(
             distance_from_files("test/test_reordered.fasta", "test/test.fasta")
                 .expect("fixtures should compare"),
@@ -365,10 +346,9 @@ mod tests {
 
     #[test]
     fn a_mismatched_name_set_errs_end_to_end() {
-        // Previously this produced a number: the iteration ran to A's sequence count and
-        // the missing sequences were simply skipped, giving d(3-seq, 2-seq) = 0.25 and
-        // d(2-seq, 3-seq) = 0.5 for the same pair. The failure has to surface as an
-        // `Err`, and it has to surface from the same entry point `main.rs` calls.
+        // Two alignments over different name sets have no shared homology to compare, so
+        // this must be an `Err` rather than a distance computed over whichever sequences
+        // happen to overlap. Checked from the same entry point `main.rs` calls.
         let a = msa(&[("x", "AA--"), ("y", "A--A"), ("z", "AAA-")]);
         let b = msa(&[("x", "A-A-"), ("y", "A--A")]);
 
@@ -390,8 +370,8 @@ mod tests {
     #[test]
     fn an_undefined_ratio_errs_rather_than_returning_nan() {
         // One sequence per alignment: a residue's homology set is its column minus
-        // itself, so every set is empty and the ratio is 0/0. The old code divided
-        // anyway and returned NaN, which `main.rs` would have written to the CSV.
+        // itself, so every set is empty and the ratio is 0/0. Dividing anyway would put
+        // a NaN in the CSV, where it reads like a result.
         let a = msa(&[("only", "AC-G")]);
         let b = msa(&[("only", "A-CG")]);
 
@@ -433,9 +413,9 @@ mod tests {
 
     #[test]
     fn every_homology_set_has_size_num_seqs_minus_one() {
-        // The invariant the module docs lean on, pinned: it is what makes `2·|A|` and
-        // `|A| + |B|` agree today, so if it ever stops holding, the fixture value above
-        // is expected to move and this test says why.
+        // The invariant the module docs rest on. It is what makes `2·|A|` and `|A| + |B|`
+        // agree, so if it ever stops holding, the fixture values above are expected to
+        // move and this test names the reason.
         let m = msa(&[("a", "A-BC-"), ("b", "-AB-C"), ("c", "AB-C-")]);
         let registry = Registry::for_pair(&m, &m).expect("same name set");
         let view = homology_view(&m, &registry).expect("view should build");
@@ -457,11 +437,11 @@ mod tests {
     /// The distance computed the slow, literal way: materialise every residue's
     /// homology set (its column *minus itself*) and work from those.
     ///
-    /// This is the definition the metric is stated in, and the shape the code had
-    /// before `CODE_REVIEW.md` §2 was fixed. `compute_symmetric_difference` now works
-    /// from the shared column sets instead, which is only valid because the excluded
-    /// element is the same value in both alignments and so cancels out of the symmetric
-    /// difference. This function exists to check that claim rather than assume it.
+    /// This is the definition the metric is stated in.
+    /// `compute_symmetric_difference` works from the shared columns instead, which is
+    /// valid only because the excluded element is the same value in both alignments and
+    /// so cancels out of the symmetric difference. This function exists to check that
+    /// rather than assume it.
     fn distance_from_materialised_sets(a: &Msa, b: &Msa) -> Option<f64> {
         let registry = Registry::for_pair(a, b).ok()?;
         let view_a = homology_view(a, &registry).ok()?;
@@ -514,12 +494,10 @@ mod tests {
 
     #[test]
     fn sharing_the_column_sets_computes_exactly_the_materialised_distance() {
-        // *** The correctness argument for the `CODE_REVIEW.md` §2 memory fix. ***
-        //
-        // `compute_symmetric_difference` reads the shared column sets, which include
-        // the residue itself, and subtracts one per side from the denominator only. The
-        // claim is that this is not an approximation but exactly equal to working from
-        // materialised homology sets, because the excluded element is
+        // `compute_symmetric_difference` reads the shared columns, which include the
+        // residue itself, and subtracts one per side from the denominator only. This
+        // asserts the result is exactly equal to working from materialised homology
+        // sets, which holds because the excluded element is
         // `{sequence, position, gap: false}` in *both* alignments and therefore lies in
         // both columns, so it cannot appear in the symmetric difference.
         //
@@ -552,9 +530,9 @@ mod tests {
 
     #[test]
     fn a_column_set_is_stored_once_no_matter_how_many_residues_share_it() {
-        // The memory property itself, as opposed to the numeric one: storage is one set
-        // per column, not one per residue. Before the fix this alignment held 6 sets of
-        // 3 elements; it now holds 3 sets of 3.
+        // Storage is one column per alignment column, shared by the residues in it,
+        // rather than one set per residue. This alignment has 6 residues across 3
+        // columns, so it holds 3 columns of 3 elements.
         let m = msa(&[("a", "ABC"), ("b", "ABC"), ("c", "AB-")]);
         let registry = Registry::for_pair(&m, &m).expect("same name set");
         let view = homology_view(&m, &registry).expect("view should build");

@@ -1,7 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# The image the justfile's `build-docker` / `push-docker` / `run-docker-it` recipes have
-# always referred to. It did not exist until now, so all three of them failed.
+# The image the justfile's `build-docker` / `push-docker` / `run-docker-it` recipes use.
 #
 # Two stages: a toolchain image that compiles, and a bare Debian that carries only the
 # binary. The build stage is ~1.5 GB and none of it is needed at runtime.
@@ -22,9 +21,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked \
     && cp target/release/rusty-metal /usr/local/bin/rusty-metal
 
-# `--locked` is deliberate: Cargo.lock is committed, and a Docker build silently picking
-# up newer dependencies than the tested tree is exactly the kind of drift that makes an
-# image irreproducible.
+# `--locked` because Cargo.lock is committed: a build that silently picked up newer
+# dependencies than the tested tree would produce an image nobody can reproduce.
 
 FROM debian:bookworm-slim
 
@@ -46,8 +44,7 @@ WORKDIR /data
 #
 CMD ["rusty-metal", "--help"]
 
-# Runs as root, which is the right call for a tool whose whole job is reading and writing
-# files in a bind-mounted directory. A baked-in non-root UID cannot write to a host
-# directory owned by anyone else, and the alternative — asking every user to pass
-# `--user $(id -u):$(id -g)` — trades a small hardening win for a large papercut. There
-# is no network listener here and nothing persistent in the image.
+# Runs as root. The tool reads and writes files in a bind-mounted directory, and a
+# baked-in non-root UID cannot write to a host directory owned by anyone else, which
+# would leave every user passing `--user $(id -u):$(id -g)`. There is no network listener
+# here and nothing persistent in the image.

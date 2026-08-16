@@ -1,44 +1,33 @@
 //! The homology view: for every residue in an alignment, the set of elements that
 //! share its column.
 //!
-//! This is `utils::create_hashsets` rebuilt as a *derived view* over the shared
-//! [`Msa`] type rather than as the parse target. Two things change, and both are
-//! deliberate behaviour fixes rather than refactoring noise:
+//! A view is derived from an [`Msa`] rather than parsed from a file, so the same
+//! alignment can be read once and viewed against several partners.
 //!
-//! - **Sequences are identified by name, not by their ordinal position in the file.**
-//!   The old reader passed a record counter as the sequence id (`utils.rs:74`), so two
-//!   files holding the same alignment with the records written in a different order had
-//!   disjoint element identities and reported a distance of `0.571` instead of `0`
-//!   (`CODE_REVIEW.md` §0). Ids now come from a [`Registry`] shared across the pair of
-//!   alignments being compared, which also gives us a place to reject two alignments
-//!   that are not over the same sequences at all.
+//! Two properties of element identity govern everything here:
+//!
+//! - **Sequences are identified by name, not by their position in the file.** Ids come
+//!   from a [`Registry`] shared across the pair of alignments being compared, so two
+//!   files holding the same alignment with the records written in a different order
+//!   produce the same element identities. The registry is also where a pair that is not
+//!   over the same set of sequences is rejected.
 //! - **Element identity excludes the raw character.** An element is
 //!   `(sequence, position, is-gap)` and nothing else, so the same residue written `a` in
-//!   one file and `A` in another compares equal — the metric is case-insensitive with no
-//!   normalisation pass over the input. See [`residue_code`] for how that identity is
-//!   stored, and the test-only `Element` type for the full argument.
+//!   one file and `A` in another compares equal, and the metric is case-insensitive
+//!   without a normalisation pass over the input. See [`residue_code`] for how the
+//!   identity is stored and the test-only `Element` type for the reasoning.
 //!
-//! A residue is addressed as `[sequence][residue position]`, with `None` meaning "this
-//! sequence has no residue at that position" (i.e. past its end).
+//! A residue is addressed as `[sequence][residue position]`, with `None` meaning the
+//! sequence has no residue at that position, i.e. it is past the end of that sequence's
+//! residues.
 //!
-//! # How the storage got here
+//! # Storage
 //!
-//! Three shapes, each a strict improvement on the last:
-//!
-//! 1. The old `MsaHashSets` stored a separate `HashSet` at every `[sequence][position]`
-//!    slot — O(num_seqs² × width) per alignment, which is `CODE_REVIEW.md` §2.
-//! 2. Then one `HashSet` per *column*, shared by every residue in it, indexed through a
-//!    slot table: O(num_seqs × width).
-//! 3. Now no hash sets at all. A column holds exactly one element per sequence, so the
-//!    set structure was never doing any work — see `residue_code` / `gap_code` for the
-//!    encoding and `distance::compute_symmetric_difference` for the identity that makes
-//!    it exact.
-//!
-//! Step 3 is a constant-factor change on paper and a large one in practice: a 500 × 5000
-//! alignment held 5000 sets of 500 16-byte elements, each rounded up to 1024 hash
-//! buckets — 87 MB per view, of which more than half was empty bucket. The same view is
-//! now a flat `Vec<u32>` of 10 MB, and the comparison is a linear scan rather than a
-//! hash probe per element.
+//! A column holds exactly one element per sequence, so a column is stored as a run of
+//! `u32` codes rather than as a set: see [`residue_code`] and [`gap_code`] for the
+//! encoding, and `distance::compute_symmetric_difference` for the identity that makes
+//! comparing two runs give the same answer as comparing two homology sets. Every residue
+//! in a column shares the one stored copy, reached through a slot table.
 
 use crate::msa::{Msa, is_gap};
 use anyhow::{Result, bail};
@@ -54,29 +43,19 @@ use std::collections::{HashMap, HashSet};
 ///
 /// # Identity
 ///
-/// `Element` is keyed on `(seq, position, gap)` and *nothing else*. Two points about
-/// that, both of which are easy to get wrong:
+/// `Element` is keyed on `(seq, position, gap)` and nothing else. Two points about that:
 ///
-/// - **`gap` is a stored field, not something inferred.** The old `SequenceElement`
-///   carried a `Base` enum whose `GAP` variant is what distinguished a gap from a
-///   residue. That enum is being retired, and without an explicit flag a residue at
-///   position 0 and a gap whose preceding residue is position 0 would be
-///   indistinguishable — they would collide in the hash set and the two very different
-///   things would compare equal.
-/// - **The residue character is deliberately not part of this type.** The old
-///   `SequenceElement::eq` compared `base`, but the reader uppercased every input byte
-///   first. [`crate::msa::read_msa`] no longer does (it has to round-trip sequences to
-///   disk faithfully), so keying on the character would make the same residue written
-///   `a` in one file and `A` in another compare unequal and inflate the distance. This
-///   loses no information: for a fixed sequence and a fixed position the residue is
-///   already determined, so the character never contributed anything to identity in the
-///   first place. Dropping it makes the metric case-insensitive with no normalisation
-///   pass.
+/// - **`gap` is stored rather than inferred.** Without an explicit flag, a residue at
+///   position 0 and a gap whose preceding residue is at position 0 would be
+///   indistinguishable, and those two very different things would compare equal.
+/// - **The residue character is not part of this type.** [`crate::msa::read_msa`]
+///   preserves case, because the alignment has to round-trip to disk faithfully, so
+///   keying on the character would make the same residue written `a` in one file and `A`
+///   in another compare unequal and inflate the distance. Excluding it loses no
+///   information: for a fixed sequence and a fixed position the residue is already
+///   determined, so the character never contributed to identity.
 ///
 /// # Position
-///
-/// `position` follows the old `Sequence::from_characters`
-/// (`datastructures.rs:206-233`) exactly:
 ///
 /// - a **residue**'s position is its index among the non-gap characters of its row;
 /// - a **gap**'s position is the index of the residue *preceding* it in its row, i.e.
@@ -94,11 +73,8 @@ pub struct Element {
     gap: bool,
 }
 
-// `Element` deliberately has no accessors. Its three fields exist only to give the
-// value an identity, and nothing outside this module has ever needed to read one back —
-// the metric only asks whether two elements are equal. Accessors were written in Stage 3
-// and removed in Stage 6 as dead code; if a caller ever needs them, they are three
-// one-line functions.
+// `Element` has no accessors. Its three fields exist to give the value an identity, and
+// the metric only asks whether two elements are equal.
 
 // ---------------------------------------------------------------------------------
 // The stored form: one u32 per (sequence, column)
@@ -121,11 +97,11 @@ const MAX_WIDTH: usize = (u32::MAX >> 1) as usize;
 
 /// A residue at `position`, encoded.
 ///
-/// Residues take the even codes, gaps the odd ones, so the low bit *is* the gap flag —
-/// which is what the old `Element::gap` field stored explicitly. Keeping the two apart
-/// matters for the reason `a_gap_after_residue_zero_is_not_a_residue_at_position_zero`
-/// gives: a residue at position 0 and the gap that follows it are different elements,
-/// and conflating them would silently shrink a homology set.
+/// Residues take the even codes and gaps the odd ones, so the low bit is the gap flag.
+/// Keeping the two apart matters for the reason
+/// `a_gap_after_residue_zero_is_not_a_residue_at_position_zero` gives: a residue at
+/// position 0 and the gap that follows it are different elements, and conflating them
+/// would silently shrink a homology set.
 const fn residue_code(position: u32) -> u32 {
     position << 1
 }
@@ -177,10 +153,8 @@ fn decode(seq: u32, code: u32) -> Element {
 // the column, so storing it would be storing the index alongside the value. What is left
 // — `(position, gap)` — is what the codes above encode.
 //
-// That is what makes a hash set unnecessary rather than merely wasteful. The set
-// operations the metric asks for reduce to positional comparison: see
-// `distance::compute_symmetric_difference` for `|A Δ B| = 2·#{s : a[s] ≠ b[s]}`, which is
-// the whole justification.
+// The set operations the metric asks for therefore reduce to positional comparison: see
+// `distance::compute_symmetric_difference` for `|A Δ B| = 2·#{s : a[s] ≠ b[s]}`.
 //
 // The invariant this rests on is "one element per sequence per column". It is pinned by
 // `distance::tests::every_homology_set_has_size_num_seqs_minus_one` and checked
@@ -192,8 +166,8 @@ fn decode(seq: u32, code: u32) -> Element {
 /// A name-to-id mapping shared by the two alignments in a comparison.
 ///
 /// The ids handed out here are what makes the metric independent of record order in the
-/// input files. Names are unique on every [`Msa`] (enforced by `Msa::new` since Stage
-/// 2), so no de-duplication is needed here.
+/// input files. `Msa::new` enforces unique names on every [`Msa`], so nothing is
+/// de-duplicated here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Registry {
     /// Registry index -> name. Sorted, so `for_pair(a, b)` and `for_pair(b, a)` produce
@@ -208,10 +182,10 @@ impl Registry {
     /// exactly the same set of sequence names.
     ///
     /// This is the check that tells a user their two alignments are not comparable, so
-    /// the error names the sequences involved on both sides rather than just reporting
-    /// that the sets differ. Previously nothing validated this at all: mismatched
-    /// alignments were silently compared over a truncated overlap, and `d(a, b)` and
-    /// `d(b, a)` disagreed (`CODE_REVIEW.md` §0).
+    /// the error names the sequences involved on both sides rather than reporting only
+    /// that the sets differ. Without it a mismatched pair would be compared over
+    /// whichever sequences happened to overlap, and `d(a, b)` and `d(b, a)` could
+    /// disagree.
     pub fn for_pair(a: &Msa, b: &Msa) -> Result<Registry> {
         let names_a: HashSet<&str> = a.names().iter().map(|n| n.as_str()).collect();
         let names_b: HashSet<&str> = b.names().iter().map(|n| n.as_str()).collect();
@@ -315,18 +289,14 @@ fn format_names(names: &[&str]) -> String {
 /// because the hot path reads whole columns: `column_of` hands out a contiguous slice and
 /// the comparison walks two of them in step.
 ///
-/// # Why not one `HashSet` per residue, or per column
+/// # Why codes rather than sets
 ///
-/// Per residue was `CODE_REVIEW.md` §2: cloning the column set for every residue costs
-/// O(num_seqs² × width) live memory per alignment, both alignments are held at once, and
-/// that is multiplied again by the number of pairs running concurrently. A 500 × 5000
-/// alignment came to roughly 1.2×10⁹ set entries.
-///
-/// Per column fixed the exponent — O(num_seqs × width) — but kept a hash table per
-/// column: 500 elements of 16 bytes in 1024 buckets, 87 MB per view for that same
-/// alignment, over half of it empty bucket. The codes above drop the set entirely, since
-/// a column holds one element per sequence and the sequence is the offset. Measured on a
-/// 500 × 5000 pair, peak RSS went from 330 MB to 49 MB and the run from 3.5 s to 0.7 s.
+/// A homology set per residue would cost O(num_seqs² × width) per alignment, and both
+/// alignments of a pair are held at once, multiplied again by the number of pairs running
+/// concurrently. Sharing one set per column brings that to O(num_seqs × width) but keeps
+/// a hash table per column, most of whose buckets are empty at these sizes. Since a
+/// column holds one element per sequence and the sequence is the offset into the column,
+/// the codes above carry the same information in a flat slice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HomologyView {
     /// Column-major element codes: `codes[column * num_seqs + sequence]`.
@@ -343,8 +313,8 @@ pub struct HomologyView {
     /// residues they sit alongside.
     ///
     /// A column index is `< width ≤ MAX_WIDTH < u32::MAX`, so the sentinel is
-    /// unambiguous. This was `Vec<Vec<Option<usize>>>`, which spent 16 bytes on a value
-    /// that fits in 4 and one allocation per sequence.
+    /// unambiguous, and a flat `Vec<u32>` needs neither an `Option` nor one allocation
+    /// per sequence.
     slots: Vec<u32>,
     /// The sequence dimension, from the registry rather than from the alignment's own
     /// row count. Held explicitly because both `Vec`s are flat.
@@ -363,7 +333,7 @@ impl HomologyView {
     /// is no residue there.
     ///
     /// **This is the residue's homology set *including* the residue itself**, which is
-    /// deliberate and is what lets the sets be shared. Two facts make the difference
+    /// what lets a column be shared by the residues in it. Two facts make the difference
     /// cancel when two views are compared:
     ///
     /// - A residue's own element is `{sequence, position, gap: false}`, and that is the
@@ -415,8 +385,9 @@ impl HomologyView {
     /// The homology set of the residue at `(sequence, position)`: its column **minus
     /// the residue itself**, which is the definition the metric is stated in terms of.
     ///
-    /// Allocates, for the same reason as [`HomologyView::column_set_of`]. The distance
-    /// path must not call it, or `CODE_REVIEW.md` §2 comes straight back.
+    /// Allocates, for the same reason as [`HomologyView::column_set_of`], and so is not
+    /// for the distance path: materialising a set per residue is what the layout exists
+    /// to avoid.
     #[cfg(test)]
     pub fn homology_set_of(&self, sequence: usize, position: usize) -> Option<HashSet<Element>> {
         let mut set = self.column_set_of(sequence, position)?;
@@ -501,10 +472,9 @@ pub fn homology_view(msa: &Msa, registry: &Registry) -> Result<HomologyView> {
     let mut codes: Vec<u32> = vec![0; num_seqs * width];
     let mut slots: Vec<u32> = vec![NO_RESIDUE; num_seqs * width];
 
-    // One pass per row rather than a transposed copy of the whole alignment first: the
-    // previous shape built an `elements[row][column]` grid (16 bytes a cell) and then
-    // read it column-wise, which doubled peak memory during the build for nothing.
-    // `scratch` holds one row's codes and is reused across rows.
+    // One pass per row, scattering into the column-major `codes`, rather than building a
+    // transposed copy of the whole alignment and reading that column-wise. `scratch`
+    // holds one row's codes and is reused across rows.
     let mut scratch: Vec<u32> = Vec::with_capacity(width);
     for (row, &seq) in msa.rows().iter().zip(seq_ids.iter()) {
         row_codes(row, &mut scratch);
@@ -534,8 +504,9 @@ pub fn homology_view(msa: &Msa, registry: &Registry) -> Result<HomologyView> {
     })
 }
 
-/// Encodes one row of the alignment into `out`, one code per column, assigning positions
-/// exactly as the old `Sequence::from_characters` did (`datastructures.rs:206-233`).
+/// Encodes one row of the alignment into `out`, one code per column: a residue's position
+/// is its index among the row's non-gap characters, and a gap's is the index of the
+/// residue preceding it in the row.
 ///
 /// `out` is cleared first and reused across rows by the caller, so the build allocates
 /// one row's worth of scratch for the whole alignment rather than one `Vec` per row.
@@ -603,10 +574,10 @@ mod tests {
         elements.iter().copied().collect()
     }
 
-    /// Reads a pair of FASTA files and runs the whole current pipeline over them:
-    /// shared registry, two views, and the Stage 4 distance. Deliberately skips
-    /// `standardise`, which is not wired in until Stage 5.
-    fn distance_via_new_path(path_a: &str, path_b: &str) -> f64 {
+    /// Reads a pair of FASTA files and runs the distance path over them: shared registry,
+    /// two views, one distance. Skips `standardise`, so these tests pin the metric on the
+    /// files as written.
+    fn distance_between_files(path_a: &str, path_b: &str) -> f64 {
         let msa_a = read_msa(path_a).expect("fixture a should read");
         let msa_b = read_msa(path_b).expect("fixture b should read");
         let registry = Registry::for_pair(&msa_a, &msa_b).expect("fixtures share a name set");
@@ -617,65 +588,40 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // The regression gate
+    // Pinned values
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn new_path_reproduces_the_baseline_distance_exactly() {
-        // `0.21428571428571427` is the number the pre-merge binary emits for this pair
-        // (recorded in INTEGRATION_NOTES.md, "Baseline"). Reproducing it bit-for-bit
-        // through the new reader, the new homology view and the new distance is what
-        // proves Stages 1-3 were a rewrite and not a behaviour change.
+    fn the_fixture_pair_distance_is_pinned() {
+        // 6/28 on the 3x4 fixtures, worked out residue by residue in
+        // `distance::tests::the_fixture_pair_distance_is_hand_verified`.
         //
-        // The two intentional divergences of the new path cannot fire here: these
-        // fixtures contain no `.` (so the widened gap definition is inert) and no
-        // lowercase (so dropping the uppercasing pass is inert). If this assertion ever
-        // fails, something unintended moved — do not update the constant.
-        //
-        // **Stage 4 was expected to move this number and did not.** The denominator
-        // changed from `2·|A|` to `|A| + |B|`, but a residue's homology set is its whole
-        // column minus itself and every element in a column carries a distinct `seq`, so
-        // `|A| = |B| = num_seqs - 1` for every residue and the two expressions agree term
-        // for term. Old value 0.21428571428571427 = 6/28; new value 0.21428571428571427
-        // = 6/28, same numerator and same denominator. The arithmetic is worked out
-        // residue by residue in `distance::tests::the_fixture_pair_distance_is_hand_verified`.
-        let distance = distance_via_new_path("test/test.fasta", "test/test2.fasta");
-        assert_eq!(
-            distance, 0.21428571428571427,
-            "the new path must reproduce the pre-merge baseline exactly"
-        );
+        // Neither of the metric's two case-dependent rules can fire on these fixtures:
+        // they contain no `.`, so the gap definition is not exercised, and no lowercase,
+        // so case insensitivity is not exercised either. A change in this number
+        // therefore means something else moved.
+        let distance = distance_between_files("test/test.fasta", "test/test2.fasta");
+        assert_eq!(distance, 0.21428571428571427);
     }
 
     // ---------------------------------------------------------------------------
-    // The headline fix: record order no longer matters
+    // Record order does not matter
     // ---------------------------------------------------------------------------
 
     #[test]
     fn reordered_records_give_distance_zero() {
-        // *** This is the test that justifies the whole stage. ***
+        // `test/test_reordered.fasta` holds exactly the alignment in `test/test.fasta` —
+        // same names, same rows, same columns — with the records written out in the order
+        // 2, 1, 3 instead of 1, 2, 3. It is the same alignment, so the distance is 0.
         //
-        // `test/test_reordered.fasta` holds exactly the alignment in `test/test.fasta`
-        // — same names, same rows, same columns — with the records written out in the
-        // order 2, 1, 3 instead of 1, 2, 3. It is the same alignment, so its distance
-        // from `test/test.fasta` must be 0.
-        //
-        // Under the old positional keying it was not. The old reader used each record's
-        // ordinal index as its sequence id (`utils.rs:74`), so sequence "2" was element
-        // id 0 in one file and id 1 in the other; elements that describe the same
-        // residue of the same sequence failed to compare equal, and the tool
-        // confidently reported 0.571 for an alignment against itself. That is the
-        // number quoted in `CODE_REVIEW.md` §0, and this record order is the one that
-        // produces it — the old answer depended on *which* permutation was used, giving
-        // 0.5 for two of the other four and 0.167 for a full reversal. Arbitrary
-        // sensitivity to record order is the bug; 0.571 is just one of its faces.
-        //
-        // This test used to assert the old path's 0.5714285714285714 alongside, so that
-        // it demonstrated the fix rather than merely asserting the fixed state. That half
-        // went with `utils::create_hashsets` in Stage 4; the old numbers survive in this
-        // comment only.
-        let new_distance = distance_via_new_path("test/test.fasta", "test/test_reordered.fasta");
+        // This is what keying sequence ids on names rather than on a record's ordinal
+        // index buys. Keyed positionally, sequence "2" would be id 0 in one file and id 1
+        // in the other, elements describing the same residue of the same sequence would
+        // not compare equal, and an alignment would have a nonzero distance from itself —
+        // by an amount that depends on which permutation the file happens to use.
+        let distance = distance_between_files("test/test.fasta", "test/test_reordered.fasta");
         assert_eq!(
-            new_distance, 0.0,
+            distance, 0.0,
             "the same alignment with its records reordered must be at distance 0"
         );
     }
@@ -709,9 +655,9 @@ mod tests {
 
     #[test]
     fn case_only_differences_do_not_affect_the_view_or_the_distance() {
-        // Stage 1 stopped uppercasing input. Identity excludes the character, so the
-        // metric is case-insensitive without any normalisation pass. If the raw byte
-        // were ever added back to `Element`, this fails.
+        // Input is not uppercased on read, and element identity excludes the character,
+        // so the metric is case-insensitive without a normalisation pass. Adding the raw
+        // byte back to `Element` fails this.
         let upper = msa(&[("s1", "AC-G"), ("s2", "A-CG")]);
         let lower = msa(&[("s1", "ac-g"), ("s2", "a-cg")]);
 
@@ -1062,9 +1008,9 @@ mod tests {
             "sequence c has only one residue"
         );
 
-        // The stored form holds each column once rather than one copy per residue — the
-        // whole point of the `CODE_REVIEW.md` §2 fix. The residue *is* in the stored
-        // column; it is only absent from the derived homology set.
+        // The stored form holds each column once rather than one copy per residue. The
+        // residue *is* in the stored column; it is only absent from the derived homology
+        // set.
         assert_eq!(view.column_sets().len(), m.width());
         assert!(
             view.column_set_of(0, 0)
@@ -1088,9 +1034,9 @@ mod tests {
     #[test]
     fn dot_and_dash_gaps_are_interchangeable() {
         // The shared `is_gap` counts both, so an alignment written with `.` produces the
-        // identical view to the same alignment written with `-`. Under the old `Base`
-        // mapping the `.` was a residue and every position after it was shifted
-        // (`CODE_REVIEW.md` §3). Not exercised by the fixtures, hence this test.
+        // identical view to the same alignment written with `-`. Treating `.` as a
+        // residue instead would shift every position after it. No fixture contains a
+        // `.`, hence this test.
         let dashes = msa(&[("s1", "A--C"), ("s2", "-AC-")]);
         let dots = msa(&[("s1", "A..C"), ("s2", ".AC.")]);
 

@@ -1,8 +1,7 @@
 #!/usr/bin/env just --justfile
 
 latest-tag := "0.2.0"
-# Matches the crate and binary name. Was `dlejeune/pipeline-utils-rs`, which matched
-# nothing else in the repo.
+# Matches the crate and binary name.
 image-name := "dlejeune/rusty-metal"
 
 default:
@@ -50,12 +49,11 @@ doc *args="":
 doc-open:
     cargo doc --no-deps --open
 
-# Formatting, lints, docs and tests — what CI runs. All four are clean as of 0.2.0.
+# Formatting, lints, docs and tests — what CI runs.
 #
-# `doc` is in here because a doc comment can rot in ways nothing else catches: a
-# `[link]` to an item that was renamed, or made `#[cfg(test)]`, still compiles and still
-# passes the tests. That is exactly how the reference to `Element` in `homology.rs`
-# survived Stage 8.
+# `doc` is in here because a doc comment can rot in ways nothing else catches: a `[link]`
+# to an item that was renamed, or made `#[cfg(test)]`, still compiles and still passes
+# the tests.
 check:
     cargo fmt --check
     cargo clippy -- -D warnings

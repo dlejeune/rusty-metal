@@ -1,17 +1,12 @@
 //! Shared multiple sequence alignment (MSA) representation.
 //!
-//! This is the row-major, byte-preserving representation that both the distance
-//! pipeline and the (forthcoming) standardisation pass build on. Unlike the older
-//! `datastructures::MultipleSequenceAlignment` / `Base` machinery in
-//! `src/datastructures.rs`, this type:
+//! The row-major, byte-preserving representation that both the standardisation pass and
+//! the distance pipeline build on. It keeps two things a distance metric alone would not
+//! need, but a tool that writes alignments back to disk does:
 //!
-//! - keeps sequence names (the old reader discarded them entirely), and
-//! - keeps raw bytes: no uppercasing, and no lossy mapping through an alphabet enum
-//!   that collapses unrecognised characters (e.g. IUPAC ambiguity codes like `B`) to
-//!   `X`.
-//!
-//! Losing either of those is fine for a pure distance metric, but not for a tool that
-//! writes alignments back to disk, which is why this type exists.
+//! - **sequence names**, which are also what the metric keys sequence identity on, and
+//! - **raw bytes**, unchanged in case and not mapped through an alphabet enum, so IUPAC
+//!   ambiguity codes and anything else unrecognised survive a round trip intact.
 
 use anyhow::{Context, Result, bail};
 use seq_io::fasta::{Reader, Record};
@@ -43,12 +38,11 @@ impl Msa {
     /// Ragged input is reported as an `Err` naming the offending record and both
     /// lengths involved, rather than panicking later when the rows are indexed.
     ///
-    /// Duplicate names are rejected here so that every later stage can assume names
-    /// are unique. Two stages depend on that: [`Msa::sort_sequences_by_name`] would
-    /// otherwise produce an order that depends on sort stability rather than on the
-    /// data, and the forthcoming name-keyed homology view would silently collapse two
-    /// records into one registry slot. Real FASTA does contain repeated ids, so this
-    /// has to be a checked error rather than an assumption.
+    /// Duplicate names are rejected here so that every later stage can assume names are
+    /// unique. Two depend on it: [`Msa::sort_sequences_by_name`] would otherwise produce
+    /// an order determined by sort stability rather than by the data, and the name-keyed
+    /// homology view would collapse two records into one registry slot. Real FASTA does
+    /// contain repeated ids, so this is a checked error rather than an assumption.
     pub fn new(names: Vec<String>, rows: Vec<Vec<u8>>) -> Result<Msa> {
         if names.len() != rows.len() {
             bail!(
