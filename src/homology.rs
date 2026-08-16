@@ -12,7 +12,11 @@
 //!   (`CODE_REVIEW.md` §0). Ids now come from a [`Registry`] shared across the pair of
 //!   alignments being compared, which also gives us a place to reject two alignments
 //!   that are not over the same sequences at all.
-//! - **Element identity excludes the raw character.** See [`Element`].
+//! - **Element identity excludes the raw character.** An element is
+//!   `(sequence, position, is-gap)` and nothing else, so the same residue written `a` in
+//!   one file and `A` in another compares equal — the metric is case-insensitive with no
+//!   normalisation pass over the input. See [`residue_code`] for how that identity is
+//!   stored, and the test-only `Element` type for the full argument.
 //!
 //! A residue is addressed as `[sequence][residue position]`, with `None` meaning "this
 //! sequence has no residue at that position" (i.e. past its end).

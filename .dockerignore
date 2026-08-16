@@ -1,0 +1,15 @@
+# The build context is sent to the daemon in full before anything runs, and `target`
+# alone is several gigabytes on a developed tree — larger than the toolchain image it
+# would be copied into. Excluding it is the difference between a build that starts
+# immediately and one that spends a minute uploading artefacts it then overwrites.
+target/
+.git/
+.gitignore
+.idea/
+
+# Documentation and fixtures. Nothing in the build reads them, and a change to a
+# markdown file should not invalidate the COPY layer and force a full recompile.
+*.md
+test/
+Dockerfile
+.dockerignore

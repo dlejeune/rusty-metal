@@ -1,0 +1,106 @@
+name: CI
+
+# Mirrors `just check` on every push and pull request, and publishes the rustdoc output
+# to GitHub Pages when main moves. The two are one workflow rather than two so that the
+# docs job can depend on the checks: a tree that does not compile should not replace a
+# working documentation site.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, docs, tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner image ships a current stable toolchain with rustfmt and clippy, so
+      # there is nothing to install. Edition 2024 needs 1.85 or newer, which stable has
+      # been since February 2025.
+      - name: Toolchain versions
+        run: |
+          rustc --version
+          cargo clippy --version
+          cargo fmt --version
+
+      - name: Cache the registry and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # Same four commands as `just check`, in the same order, kept as separate steps so
+      # the failing one is named in the job summary rather than buried in a log.
+      - name: Formatting
+        run: cargo fmt --check
+
+      - name: Lints
+        run: cargo clippy -- -D warnings
+
+      # Catches doc rot that nothing else does: a [`link`] to an item that was renamed or
+      # made #[cfg(test)] still compiles and still passes the tests.
+      - name: Documentation
+        run: cargo rustdoc --bin rusty-metal -- -D warnings
+
+      - name: Tests
+        run: cargo test
+
+  docs:
+    name: publish rustdoc to Pages
+    needs: check
+    # Only from main. On a pull request `github.ref` is refs/pull/N/merge, so this also
+    # keeps forks from deploying.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    permissions:
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+
+    # Never cancel a half-finished deployment: the site would be left mid-upload.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+
+      # Private items are documented without asking for it: this is a binary target and
+      # every module in it is private to main.rs, so the library default would publish an
+      # empty page. --no-deps keeps the output to this crate; links into std and the
+      # dependencies resolve to docs.rs.
+      - name: Build the documentation
+        run: cargo doc --no-deps
+
+      # rustdoc writes target/doc/rusty_metal/index.html and nothing at target/doc
+      # itself, so without this the site root is a 404.
+      - name: Redirect the site root at the crate page
+        run: |
+          echo '<!doctype html><meta http-equiv="refresh" content="0; url=rusty_metal/index.html">' \
+            > target/doc/index.html
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/doc
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
