@@ -921,8 +921,116 @@ Every finding in the review is addressed: Â§0 (both), Â§1 (all three panics)
 (both), Â§4 (both), Â§5 (both), and the build warnings. Nothing in that document is
 outstanding.
 
-Remaining known work, none of it from the review:
+Remaining known work, none of it from the review (superseded by Stage 8's list, which
+also records what a measurement turned up here):
 
 - The O(widthÂ² Ã— num_seqs) ordering cost, deferred with the measurements above.
 - No Dockerfile, though the justfile has `build-docker` recipes referencing one.
 
+
+---
+
+## Stage 8 - the hash sets go away entirely - DONE
+
+Not a `CODE_REVIEW.md` item. Stage 7 discharged the review's §2 by sharing one `HashSet`
+per column instead of cloning one per residue, which fixed the exponent. This stage
+removes the sets themselves. 97 unit tests, all passing; `just check` clean.
+
+Prompted by a measurement rather than a hunch: a single 500 x 5000 pair (2.4 MB of FASTA
+each side) peaked at **330 MB**, a 66x blow-up over the input, and it still multiplied by
+thread count - 6 pairs of 300 x 3000 went from 134 MB at `-n 1` to 662 MB at `-n 6`.
+
+### Where the 330 MB was
+
+Struct sizes measured with `rustc`, not assumed. The four items below sum to ~314 MB of
+the 330:
+
+| Structure | Cost | Why |
+|---|---|---|
+| `columns: Vec<HashSet<Element>>` | 174 MB | `Element` is 16 B; a 500-element set rounds up to 1024 buckets, so 17 KB per column x 5000 columns x 2 views. Over half of that is empty bucket |
+| `slots: Vec<Vec<Option<usize>>>` | 80 MB | `Option<usize>` is 16 B to hold a column index that fits in 4, plus one allocation per sequence |
+| `contributions: Vec<Option<ResidueContribution>>` | 60 MB | One 24 B entry per (sequence, position) slot, collected and then immediately folded to two numbers |
+| `elements: Vec<Vec<Element>>` | 40 MB/view | The full transposed grid, built before the columns and thrown away after |
+
+### The identity that removes the sets
+
+A column holds exactly one element per sequence, and element identity is
+`(seq, position, gap)`, so two elements from different sequences can never be equal. The
+intersection can therefore only pair `a[s]` with `b[s]`:
+
+```
+|A n B| = #{s : a[s] = b[s]}
+|A D B| = |A| + |B| - 2|A n B| = 2n - 2#{s : a[s] = b[s]} = 2 * #{s : a[s] != b[s]}
+```
+
+With `s` fixed on both sides, the `seq` component is common to both elements - which is
+also why the stored form can drop it. What is left, `(position, gap)`, packs into one
+`u32`: residues take the even codes (`position << 1`), gaps the odd ones, and `u32::MAX`
+is the leading-gap sentinel for `position: None`. The low bit is what the old
+`Element::gap` field stored explicitly.
+
+So `HomologyView` is now two flat `Vec<u32>`s:
+
+- `codes`, column-major, `[column * num_seqs + sequence]`. Column-major because the hot
+  path reads whole columns; `column_of` hands out a contiguous slice.
+- `slots`, `[sequence * width + position] -> column`, with `u32::MAX` for "no residue
+  here".
+
+and `|A D B|` is a linear scan of two slices. No hashing anywhere on the distance path.
+
+### Measured
+
+Same three workloads, before and after, release build, peak working set:
+
+```
+                              before     after
+1 pair 500x5000               330 MB     49 MB     3.5 s -> 0.7 s
+6 pairs 300x3000, -n 1        134 MB     22 MB
+6 pairs 300x3000, -n 6        662 MB     92 MB
+```
+
+The full pipeline with standardisation on is also 49 MB on the 500 x 5000 pair, so
+`standardise` is not the constraint at this size.
+
+The speed-up was not the goal and is worth being explicit about: it comes from deleting
+work (hash probes, allocation, a 60 MB `Vec` built to be folded), not from any change to
+what is computed.
+
+### It is exact, again, and checked the same way
+
+Every pinned value is unchanged - `0.21428571428571427`, `0.5`, `0`,
+`0.35714285714285715` - and no test expectation was edited. The 500 x 5000 pair returns
+`0.9927055341686596` before and after, to the last digit.
+
+`sharing_the_column_sets_computes_exactly_the_materialised_distance` still checks the
+distance against a literal implementation that materialises every homology set as a
+`HashSet`, exhaustively over every 2x3 and 3x2 alignment against every other. It now
+covers the new identity as well as Stage 7's, because the materialised side decodes the
+stored codes back into `Element`s and then does real set operations on them.
+
+### API notes
+
+- `HomologyView::column_of` returns `Option<&[u32]>` rather than `Option<&HashSet<..>>`.
+  `len()` still means the sequence count, so the denominator arithmetic is untouched.
+- `Element` is now `#[cfg(test)]`: it is the decoded form, and only the tests speak it.
+  `decode`, `column_set_of`, `column_sets` and `homology_set_of` are the bridge, all
+  `#[cfg(test)]` for the same reason - if the distance path ever calls one, the memory
+  win is gone.
+- `row_elements` is kept for the hand-worked position tests but now delegates to
+  `row_codes`, so those tests still exercise the encoder the build uses rather than a
+  parallel copy of the position rules.
+- `homology_view` now rejects an alignment whose row count differs from the registry's.
+  Unreachable through `Registry::for_pair`, but the whole encoding rests on "one element
+  per registry entry per column", and a short alignment would otherwise build short
+  columns and yield a quietly wrong distance.
+- `MAX_WIDTH` is `2^31 - 1` rather than `u32::MAX`, because a gap code is `2p + 1` and
+  that has to stay below the sentinel.
+
+### Still outstanding
+
+- The O(width^2 x num_seqs) ordering cost in `standardise`, deferred since Stage 6 with
+  measurements behind the deferral.
+- Phase 1 holds every input `Msa` for the whole run - deliberate, and documented in
+  `main.rs`, but it is ~2.5 MB per 500 x 5000 file, so a 1000-file run is ~2.5 GB before
+  any comparison starts. That is now the largest remaining memory term.
+- No Dockerfile, though the justfile has `build-docker` recipes referencing one.

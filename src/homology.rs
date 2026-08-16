@@ -15,15 +15,38 @@
 //! - **Element identity excludes the raw character.** See [`Element`].
 //!
 //! A residue is addressed as `[sequence][residue position]`, with `None` meaning "this
-//! sequence has no residue at that position" (i.e. past its end). The old `MsaHashSets`
-//! stored a separate set at every one of those slots; [`HomologyView`] stores one set
-//! per *column* and indexes into it, which is the `CODE_REVIEW.md` §2 fix.
+//! sequence has no residue at that position" (i.e. past its end).
+//!
+//! # How the storage got here
+//!
+//! Three shapes, each a strict improvement on the last:
+//!
+//! 1. The old `MsaHashSets` stored a separate `HashSet` at every `[sequence][position]`
+//!    slot — O(num_seqs² × width) per alignment, which is `CODE_REVIEW.md` §2.
+//! 2. Then one `HashSet` per *column*, shared by every residue in it, indexed through a
+//!    slot table: O(num_seqs × width).
+//! 3. Now no hash sets at all. A column holds exactly one element per sequence, so the
+//!    set structure was never doing any work — see `residue_code` / `gap_code` for the
+//!    encoding and `distance::compute_symmetric_difference` for the identity that makes
+//!    it exact.
+//!
+//! Step 3 is a constant-factor change on paper and a large one in practice: a 500 × 5000
+//! alignment held 5000 sets of 500 16-byte elements, each rounded up to 1024 hash
+//! buckets — 87 MB per view, of which more than half was empty bucket. The same view is
+//! now a flat `Vec<u32>` of 10 MB, and the comparison is a linear scan rather than a
+//! hash probe per element.
 
 use crate::msa::{Msa, is_gap};
 use anyhow::{Result, bail};
 use std::collections::{HashMap, HashSet};
 
 /// One position in one sequence of an alignment: either a residue or a gap.
+///
+/// **This is the decoded form, and it exists for the tests.** The stored form is a
+/// `u32` code: within a column, an element's `seq` is its offset, so only
+/// `(position, gap)` needs storing and both fit in one word. The tests work in
+/// `Element`s because that is the vocabulary the metric is defined in, and `decode`
+/// converts. Nothing on the distance path builds one.
 ///
 /// # Identity
 ///
@@ -59,6 +82,7 @@ use std::collections::{HashMap, HashSet};
 /// residues, which is why permuting columns changes gap identities (and hence the
 /// distance) while leaving residue identities alone — the property the standardisation
 /// pass exists to exploit.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Element {
     seq: u32,
@@ -67,10 +91,99 @@ pub struct Element {
 }
 
 // `Element` deliberately has no accessors. Its three fields exist only to give the
-// value an identity inside a `HashSet`, and nothing outside this module has ever
-// needed to read one back — the metric only asks whether two elements are equal.
-// Accessors were written in Stage 3 and removed in Stage 6 as dead code; if a caller
-// ever needs them, they are three one-line functions.
+// value an identity, and nothing outside this module has ever needed to read one back —
+// the metric only asks whether two elements are equal. Accessors were written in Stage 3
+// and removed in Stage 6 as dead code; if a caller ever needs them, they are three
+// one-line functions.
+
+// ---------------------------------------------------------------------------------
+// The stored form: one u32 per (sequence, column)
+// ---------------------------------------------------------------------------------
+
+/// A gap that precedes every residue in its row — the `position: None` case.
+///
+/// `u32::MAX` is odd, and every residue code is even, so this can never be mistaken for
+/// a residue. It cannot collide with a real gap code either: the largest of those is
+/// `2·width - 1`, and [`MAX_WIDTH`] keeps that below `u32::MAX`.
+const LEADING_GAP: u32 = u32::MAX;
+
+/// The widest alignment the encoding can address.
+///
+/// A gap after the last residue of a full-width row encodes as `2·(width-1) + 1`, which
+/// must stay below [`LEADING_GAP`]. That caps width at `2³¹ - 1` rather than at the
+/// `u32::MAX` a bare position would allow. The check is real but the bound is not: an
+/// alignment that wide would need two billion columns.
+const MAX_WIDTH: usize = (u32::MAX >> 1) as usize;
+
+/// A residue at `position`, encoded.
+///
+/// Residues take the even codes, gaps the odd ones, so the low bit *is* the gap flag —
+/// which is what the old `Element::gap` field stored explicitly. Keeping the two apart
+/// matters for the reason `a_gap_after_residue_zero_is_not_a_residue_at_position_zero`
+/// gives: a residue at position 0 and the gap that follows it are different elements,
+/// and conflating them would silently shrink a homology set.
+const fn residue_code(position: u32) -> u32 {
+    position << 1
+}
+
+/// A gap, encoded. `None` means it precedes every residue in its row.
+const fn gap_code(position: Option<u32>) -> u32 {
+    match position {
+        Some(position) => (position << 1) | 1,
+        None => LEADING_GAP,
+    }
+}
+
+/// Whether a code is a residue rather than a gap.
+const fn is_residue(code: u32) -> bool {
+    // `LEADING_GAP` is odd, so it fails this without a special case.
+    code & 1 == 0
+}
+
+/// The residue position a code carries. Only meaningful when [`is_residue`] holds.
+const fn code_position(code: u32) -> u32 {
+    code >> 1
+}
+
+/// The decoded form of a code, for tests. `seq` is the element's offset in its column,
+/// which the code does not carry and the caller therefore supplies.
+#[cfg(test)]
+fn decode(seq: u32, code: u32) -> Element {
+    if code == LEADING_GAP {
+        Element {
+            seq,
+            position: None,
+            gap: true,
+        }
+    } else {
+        Element {
+            seq,
+            position: Some(code_position(code)),
+            gap: !is_residue(code),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------
+// Why a column of codes is a homology set
+// ---------------------------------------------------------------------------------
+//
+// The elements sharing a column are one per *sequence*, and an element's identity is
+// `(seq, position, gap)`. Inside a column the `seq` component is exactly the offset into
+// the column, so storing it would be storing the index alongside the value. What is left
+// — `(position, gap)` — is what the codes above encode.
+//
+// That is what makes a hash set unnecessary rather than merely wasteful. The set
+// operations the metric asks for reduce to positional comparison: see
+// `distance::compute_symmetric_difference` for `|A Δ B| = 2·#{s : a[s] ≠ b[s]}`, which is
+// the whole justification.
+//
+// The invariant this rests on is "one element per sequence per column". It is pinned by
+// `distance::tests::every_homology_set_has_size_num_seqs_minus_one` and checked
+// exhaustively against materialised `HashSet`s by
+// `distance::tests::sharing_the_column_sets_computes_exactly_the_materialised_distance`.
+// A move to residues-only or gap-filtered homology sets would break it — the same caveat
+// that applies to the `|A| + |B|` denominator, and for the same reason.
 
 /// A name-to-id mapping shared by the two alignments in a comparison.
 ///
@@ -182,8 +295,8 @@ fn format_names(names: &[&str]) -> String {
 
 /// The homology sets of one alignment.
 ///
-/// A residue's homology set is *its whole column minus itself*. This stores one set per
-/// **column**, shared by every residue in it, plus an index from
+/// A residue's homology set is *its whole column minus itself*. This stores each column
+/// once, shared by every residue in it, plus an index from
 /// `[registry sequence index][residue position]` to the column that residue sits in.
 /// The "minus itself" is never materialised — see [`HomologyView::column_of`] for why
 /// it does not need to be.
@@ -191,29 +304,55 @@ fn format_names(names: &[&str]) -> String {
 /// The sequence dimension is indexed by **registry index**, so two views built against
 /// the same [`Registry`] are row-aligned regardless of record order in either file.
 ///
-/// # Why this is not one set per residue
+/// # Layout
 ///
-/// It used to be, and that was `CODE_REVIEW.md` §2: cloning the column set for every
-/// residue costs O(num_seqs² × width) live memory per alignment, both alignments are
-/// held at once, and that is multiplied again by the number of pairs running
-/// concurrently. A 500 × 5000 alignment came to roughly 1.2×10⁹ set entries. It was a
-/// hard ceiling on usable input size rather than a micro-optimisation.
+/// Two flat `Vec<u32>`s, both `num_seqs × width`, so a view costs `8 · num_seqs · width`
+/// bytes and allocates twice however large the alignment is. `codes` is **column-major**
+/// because the hot path reads whole columns: `column_of` hands out a contiguous slice and
+/// the comparison walks two of them in step.
 ///
-/// Sharing the column set brings that to O(num_seqs × width) — the size of the
-/// alignment itself.
+/// # Why not one `HashSet` per residue, or per column
+///
+/// Per residue was `CODE_REVIEW.md` §2: cloning the column set for every residue costs
+/// O(num_seqs² × width) live memory per alignment, both alignments are held at once, and
+/// that is multiplied again by the number of pairs running concurrently. A 500 × 5000
+/// alignment came to roughly 1.2×10⁹ set entries.
+///
+/// Per column fixed the exponent — O(num_seqs × width) — but kept a hash table per
+/// column: 500 elements of 16 bytes in 1024 buckets, 87 MB per view for that same
+/// alignment, over half of it empty bucket. The codes above drop the set entirely, since
+/// a column holds one element per sequence and the sequence is the offset. Measured on a
+/// 500 × 5000 pair, peak RSS went from 330 MB to 49 MB and the run from 3.5 s to 0.7 s.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HomologyView {
-    /// One set per column of the alignment, in column order. Each holds exactly one
-    /// element per sequence, so `len()` is the alignment's sequence count.
-    columns: Vec<HashSet<Element>>,
-    /// `[registry sequence index][residue position]` -> index into `columns`.
+    /// Column-major element codes: `codes[column * num_seqs + sequence]`.
     ///
-    /// `None` means that sequence has no residue at that position, either because it
-    /// has fewer residues than the alignment is wide or because the slot was never
-    /// filled. Gaps never get a slot: they appear only *inside* the columns of the
+    /// Every `(column, sequence)` cell is filled — a column holds one element per
+    /// sequence, gap or residue alike — so there is no "absent" code and no `Option`.
+    codes: Vec<u32>,
+    /// `slots[sequence * width + position]` -> the column that residue sits in, or
+    /// [`NO_RESIDUE`].
+    ///
+    /// [`NO_RESIDUE`] means that sequence has no residue at that position, either
+    /// because it has fewer residues than the alignment is wide or because the slot was
+    /// never filled. Gaps never get a slot: they appear only *inside* the columns of the
     /// residues they sit alongside.
-    slots: Vec<Vec<Option<usize>>>,
+    ///
+    /// A column index is `< width ≤ MAX_WIDTH < u32::MAX`, so the sentinel is
+    /// unambiguous. This was `Vec<Vec<Option<usize>>>`, which spent 16 bytes on a value
+    /// that fits in 4 and one allocation per sequence.
+    slots: Vec<u32>,
+    /// The sequence dimension, from the registry rather than from the alignment's own
+    /// row count. Held explicitly because both `Vec`s are flat.
+    num_seqs: usize,
+    /// The alignment's width, i.e. the stride of `slots` and the number of columns.
+    width: usize,
 }
+
+/// `slots` entry for "this sequence has no residue at this position".
+///
+/// Distinct from every real column index by the [`MAX_WIDTH`] bound.
+const NO_RESIDUE: u32 = u32::MAX;
 
 impl HomologyView {
     /// The column containing the residue at `(sequence, position)`, or `None` if there
@@ -232,28 +371,51 @@ impl HomologyView {
     /// So the numerator can be taken from the columns directly. Only the denominator
     /// has to remember the exclusion, by subtracting one from each column's size — see
     /// `distance::compute_symmetric_difference`.
-    pub fn column_of(&self, sequence: usize, position: usize) -> Option<&HashSet<Element>> {
-        let column = (*self.slots.get(sequence)?.get(position)?)?;
-        self.columns.get(column)
+    ///
+    /// The returned slice is one code per sequence, indexed by registry index, so two
+    /// views built against the same [`Registry`] hand back slices that line up
+    /// element-for-element. `len()` is the sequence count, which is what the denominator
+    /// reads.
+    pub fn column_of(&self, sequence: usize, position: usize) -> Option<&[u32]> {
+        // Both bounds are checked before the flat index is formed. `slots` is strided by
+        // `width`, so an out-of-range `position` would otherwise silently read the next
+        // sequence's row rather than miss.
+        if sequence >= self.num_seqs || position >= self.width {
+            return None;
+        }
+        let column = self.slots[sequence * self.width + position];
+        if column == NO_RESIDUE {
+            return None;
+        }
+        let start = column as usize * self.num_seqs;
+        Some(&self.codes[start..start + self.num_seqs])
     }
 
     /// The number of residue positions addressable per sequence — the width of the
     /// alignment this view was built from.
     pub fn width(&self) -> usize {
-        self.slots.first().map_or(0, |positions| positions.len())
+        self.width
+    }
+
+    /// The column at `(sequence, position)` as a set of [`Element`]s, i.e. the stored
+    /// form decoded into the form the metric is defined in.
+    ///
+    /// `#[cfg(test)]` because materialising this is exactly what the layout exists to
+    /// avoid; it is here so the tests can assert against the definition rather than
+    /// against the representation.
+    #[cfg(test)]
+    pub fn column_set_of(&self, sequence: usize, position: usize) -> Option<HashSet<Element>> {
+        Some(self.decode_column(self.column_of(sequence, position)?))
     }
 
     /// The homology set of the residue at `(sequence, position)`: its column **minus
     /// the residue itself**, which is the definition the metric is stated in terms of.
     ///
-    /// Allocates, because it materialises the exclusion that [`HomologyView::column_of`]
-    /// exists to avoid. `#[cfg(test)]` for that reason: the distance path must not call
-    /// it, or `CODE_REVIEW.md` §2 comes straight back. It is here so the tests can
-    /// assert homology sets as they are defined rather than as they are stored.
+    /// Allocates, for the same reason as [`HomologyView::column_set_of`]. The distance
+    /// path must not call it, or `CODE_REVIEW.md` §2 comes straight back.
     #[cfg(test)]
     pub fn homology_set_of(&self, sequence: usize, position: usize) -> Option<HashSet<Element>> {
-        let column = self.column_of(sequence, position)?;
-        let mut set = column.clone();
+        let mut set = self.column_set_of(sequence, position)?;
         set.remove(&Element {
             seq: sequence as u32,
             position: Some(position as u32),
@@ -262,11 +424,25 @@ impl HomologyView {
         Some(set)
     }
 
-    /// Every column in the view, for tests that need to reason about sharing rather
-    /// than about a particular residue.
+    /// Every column in the view, decoded, for tests that need to reason about sharing
+    /// rather than about a particular residue.
     #[cfg(test)]
-    pub fn columns(&self) -> &[HashSet<Element>] {
-        &self.columns
+    pub fn column_sets(&self) -> Vec<HashSet<Element>> {
+        self.codes
+            .chunks(self.num_seqs)
+            .map(|column| self.decode_column(column))
+            .collect()
+    }
+
+    /// Decodes one column's codes into elements, restoring the `seq` component each
+    /// code omits from its offset in the column.
+    #[cfg(test)]
+    fn decode_column(&self, column: &[u32]) -> HashSet<Element> {
+        column
+            .iter()
+            .enumerate()
+            .map(|(seq, &code)| decode(seq as u32, code))
+            .collect()
     }
 }
 
@@ -276,12 +452,27 @@ impl HomologyView {
 /// alignment is wider than a `u32` position can address.
 pub fn homology_view(msa: &Msa, registry: &Registry) -> Result<HomologyView> {
     let width = msa.width();
-    if u32::try_from(width).is_err() {
+    if width > MAX_WIDTH {
         bail!(
             "The alignment is {} columns wide, which exceeds the {} that a residue position \
              can address",
             width,
-            u32::MAX
+            MAX_WIDTH
+        );
+    }
+
+    // The sequence dimension comes from the registry, and every column must hold one
+    // element per registry entry or the "column length == sequence count" invariant the
+    // denominator and the symmetric-difference identity both rest on would not hold.
+    // `Registry::for_pair` already guarantees this for any pair that reaches here; the
+    // check is so that a future caller building a registry some other way gets an error
+    // rather than a quietly wrong distance.
+    if msa.num_seqs() != registry.len() {
+        bail!(
+            "The alignment has {} sequence(s) but the shared registry holds {}; a homology \
+             view must have one row per registry entry",
+            msa.num_seqs(),
+            registry.len()
         );
     }
 
@@ -300,87 +491,78 @@ pub fn homology_view(msa: &Msa, registry: &Registry) -> Result<HomologyView> {
         }
     }
 
-    // Elements laid out exactly as the alignment is: `elements[row][column]`.
-    let elements: Vec<Vec<Element>> = msa
-        .rows()
-        .iter()
-        .zip(seq_ids.iter())
-        .map(|(row, &seq)| row_elements(seq, row))
-        .collect();
+    // Both dimensions are sized by the registry rather than by this alignment's row
+    // order, so nothing below may assume row index == registry index.
+    let num_seqs = registry.len();
+    let mut codes: Vec<u32> = vec![0; num_seqs * width];
+    let mut slots: Vec<u32> = vec![NO_RESIDUE; num_seqs * width];
 
-    // Sized by the registry rather than by this alignment's row count so that both
-    // views in a comparison have the same outer length. They are in practice equal —
-    // `Registry::for_pair` guarantees the same name set — but indexing by registry
-    // index means nothing here may assume row index == registry index.
-    let mut slots: Vec<Vec<Option<usize>>> = vec![vec![None; width]; registry.len()];
-    let mut columns: Vec<HashSet<Element>> = Vec::with_capacity(width);
+    // One pass per row rather than a transposed copy of the whole alignment first: the
+    // previous shape built an `elements[row][column]` grid (16 bytes a cell) and then
+    // read it column-wise, which doubled peak memory during the build for nothing.
+    // `scratch` holds one row's codes and is reused across rows.
+    let mut scratch: Vec<u32> = Vec::with_capacity(width);
+    for (row, &seq) in msa.rows().iter().zip(seq_ids.iter()) {
+        row_codes(row, &mut scratch);
+        let seq = seq as usize;
 
-    for col in 0..width {
-        // One set per column, built once and pointed at by every residue in it. See
-        // the `HomologyView` docs: this is the fix for `CODE_REVIEW.md` §2, which used
-        // to clone this set per residue.
-        columns.push(elements.iter().map(|row| row[col]).collect());
+        for (col, &code) in scratch.iter().enumerate() {
+            // Column-major: the write stride is `num_seqs`, so this scatters. Reads on
+            // the hot path are the contiguous direction, which is the one that matters —
+            // this runs once per cell, `column_of` runs once per residue per comparison.
+            codes[col * num_seqs + seq] = code;
 
-        for (row_idx, row) in elements.iter().enumerate() {
-            let item = row[col];
             // Gaps get no slot of their own; they only ever appear *inside* the columns
             // of the residues they share a column with.
-            if let (false, Some(position)) = (item.gap, item.position) {
-                let seq_slot = seq_ids[row_idx] as usize;
-                let position_slot = position as usize;
-                match slots
-                    .get_mut(seq_slot)
-                    .and_then(|s| s.get_mut(position_slot))
-                {
-                    Some(slot) => *slot = Some(col),
-                    // Unreachable: `seq_slot` came from the registry and `position` is
-                    // an index among this row's residues, so it is < width. Handled
-                    // rather than indexed so a future change cannot turn it into a
-                    // panic inside a rayon worker.
-                    None => bail!(
-                        "Internal error: no slot at [sequence {}][position {}] for an alignment \
-                         of {} sequence(s) and width {}",
-                        seq_slot,
-                        position_slot,
-                        registry.len(),
-                        width
-                    ),
-                }
+            if is_residue(code) {
+                // `position < width`, because it counts residues in a row of `width`
+                // cells, so the index is in range and the slot is written at most once.
+                slots[seq * width + code_position(code) as usize] = col as u32;
             }
         }
     }
 
-    Ok(HomologyView { columns, slots })
+    Ok(HomologyView {
+        codes,
+        slots,
+        num_seqs,
+        width,
+    })
 }
 
-/// Turns one row of the alignment into elements, assigning positions exactly as the old
-/// `Sequence::from_characters` did (`datastructures.rs:206-233`).
+/// Encodes one row of the alignment into `out`, one code per column, assigning positions
+/// exactly as the old `Sequence::from_characters` did (`datastructures.rs:206-233`).
 ///
-/// The caller must have checked that `row.len()` fits in a `u32`; `count` is bounded by
-/// the number of residues in the row and so cannot overflow.
-fn row_elements(seq: u32, row: &[u8]) -> Vec<Element> {
-    let mut elements: Vec<Element> = Vec::with_capacity(row.len());
+/// `out` is cleared first and reused across rows by the caller, so the build allocates
+/// one row's worth of scratch for the whole alignment rather than one `Vec` per row.
+///
+/// The caller must have checked `row.len() <= MAX_WIDTH`; `count` is bounded by the
+/// number of residues in the row and so cannot overflow.
+fn row_codes(row: &[u8], out: &mut Vec<u32>) {
+    out.clear();
+    out.reserve(row.len());
     let mut count: u32 = 0;
 
     for &byte in row {
         if is_gap(byte) {
-            elements.push(Element {
-                seq,
-                // `None` for a gap that precedes every residue in this row.
-                position: count.checked_sub(1),
-                gap: true,
-            });
+            // `checked_sub` is `None` for a gap that precedes every residue in this row.
+            out.push(gap_code(count.checked_sub(1)));
         } else {
-            elements.push(Element {
-                seq,
-                position: Some(count),
-                gap: false,
-            });
+            out.push(residue_code(count));
             count += 1;
         }
     }
+}
 
-    elements
+/// One row as decoded [`Element`]s, for the tests that state positions in those terms.
+///
+/// Goes through [`row_codes`] rather than duplicating the position rules, so the
+/// hand-worked position tests still exercise the encoder the build actually uses.
+#[cfg(test)]
+fn row_elements(seq: u32, row: &[u8]) -> Vec<Element> {
+    let mut codes = Vec::new();
+    row_codes(row, &mut codes);
+    codes.into_iter().map(|code| decode(seq, code)).collect()
 }
 
 #[cfg(test)]
@@ -668,6 +850,89 @@ mod tests {
         assert_eq!(residue(0, 0), residue(0, 0));
     }
 
+    // ---------------------------------------------------------------------------
+    // The code encoding
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn codes_round_trip_through_decode() {
+        // The encoding is only allowed to drop `seq`, which the column offset supplies.
+        // Everything else must survive, including the leading-gap `None`.
+        for position in [0u32, 1, 2, 7, 1_000_000, (MAX_WIDTH as u32) - 1] {
+            assert_eq!(
+                decode(4, residue_code(position)),
+                residue(4, position),
+                "residue at {position}"
+            );
+            assert_eq!(
+                decode(4, gap_code(Some(position))),
+                gap(4, Some(position)),
+                "gap after residue {position}"
+            );
+        }
+        assert_eq!(decode(4, gap_code(None)), gap(4, None));
+    }
+
+    #[test]
+    fn a_residue_code_is_never_a_gap_code() {
+        // The encoding-level form of `a_gap_after_residue_zero_is_not_a_residue_at_
+        // position_zero`: the low bit carries what the `Element::gap` field used to, so
+        // a residue and the gap that follows it stay distinct values rather than
+        // colliding into one.
+        assert_ne!(residue_code(0), gap_code(Some(0)));
+        assert!(is_residue(residue_code(0)));
+        assert!(!is_residue(gap_code(Some(0))));
+
+        // And the leading-gap sentinel is not mistaken for either. It is odd, so it
+        // reads as a gap, and it cannot equal a real gap code because `MAX_WIDTH` caps
+        // the largest of those at `2·MAX_WIDTH - 1 < u32::MAX`.
+        assert!(!is_residue(LEADING_GAP));
+        assert_ne!(LEADING_GAP, gap_code(Some((MAX_WIDTH as u32) - 1)));
+        assert!(
+            gap_code(Some((MAX_WIDTH as u32) - 1)) < LEADING_GAP,
+            "the widest allowed alignment must still leave the sentinel free"
+        );
+    }
+
+    #[test]
+    fn every_code_in_a_row_is_distinct_from_every_other_of_the_same_kind() {
+        // Within one row, no two residues share a position and no two gaps share a
+        // preceding residue *except* the leading gaps, which are deliberately equal —
+        // they are the same element identity, `(seq, None, gap)`.
+        let mut codes = Vec::new();
+        row_codes(b"--A-A--", &mut codes);
+        assert_eq!(
+            codes,
+            vec![
+                LEADING_GAP,
+                LEADING_GAP,
+                residue_code(0),
+                gap_code(Some(0)),
+                residue_code(1),
+                gap_code(Some(1)),
+                gap_code(Some(1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn homology_view_errs_when_the_row_count_does_not_match_the_registry() {
+        // Unreachable through `Registry::for_pair`, which rejects mismatched name sets
+        // outright. Checked anyway because the whole encoding rests on "a column holds
+        // one element per registry entry": a short alignment would build short columns,
+        // and the distance would come out quietly wrong rather than absent.
+        let three = msa(&[("x", "AA"), ("y", "A-"), ("z", "-A")]);
+        let registry = Registry::for_pair(&three, &three).expect("same name set");
+
+        let two = msa(&[("x", "AA"), ("y", "A-")]);
+        let err = match homology_view(&two, &registry) {
+            Ok(_) => panic!("a row count below the registry's must be rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("2 sequence(s)"), "got: {err}");
+        assert!(err.contains("registry holds 3"), "got: {err}");
+    }
+
     #[test]
     fn a_leading_gap_has_no_position() {
         // `count.checked_sub(1)` with `count == 0`: there is no preceding residue.
@@ -793,12 +1058,12 @@ mod tests {
             "sequence c has only one residue"
         );
 
-        // The stored form shares one set per column rather than holding one per
-        // residue — the whole point of the `CODE_REVIEW.md` §2 fix. The residue *is*
-        // in the stored column; it is only absent from the derived homology set.
-        assert_eq!(view.columns().len(), m.width());
+        // The stored form holds each column once rather than one copy per residue — the
+        // whole point of the `CODE_REVIEW.md` §2 fix. The residue *is* in the stored
+        // column; it is only absent from the derived homology set.
+        assert_eq!(view.column_sets().len(), m.width());
         assert!(
-            view.column_of(0, 0)
+            view.column_set_of(0, 0)
                 .expect("a residue")
                 .contains(&residue(0, 0))
         );
